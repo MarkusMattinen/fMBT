@@ -2414,10 +2414,7 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
         for c in setupCommands:
             self._runSetupCmd(c)
 
-    def _resetMonkey(self, timeout=12, pollDelay=.25):
-        tryKillingMonkeyOnFailure = 1
-        failureCountSinceKill = 0
-        endTime = time.time() + timeout
+    def _startMonkey(self):
         if self._shellUid0:
             monkeyLaunch = ["monkey"]
         elif self._shellSupportsSu:
@@ -2428,11 +2425,18 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
         if self._monkeyOptions:
             monkeyLaunch += self._monkeyOptions
 
+        monkeyShellCmd = (" ".join(monkeyLaunch + ["--port", "1080"]) +
+                          " >/sdcard/fmbtandroid.monkey.outerr 2>&1")
+        _adapterLog('launching monkey: adb shell "%s"' % (monkeyShellCmd,))
+        self._runAdb(["shell", monkeyShellCmd], expectedExitStatus=None)
+
+    def _resetMonkey(self, timeout=12, pollDelay=.25):
+        tryKillingMonkeyOnFailure = 1
+        failureCountSinceKill = 0
+        endTime = time.time() + timeout
+
         while time.time() < endTime:
-            monkeyShellCmd = (" ".join(monkeyLaunch + ["--port", "1080"]) +
-                              " >/sdcard/fmbtandroid.monkey.outerr 2>&1")
-            _adapterLog('launching monkey: adb shell "%s"' % (monkeyShellCmd,))
-            self._runAdb(["shell", monkeyShellCmd], expectedExitStatus=None)
+            self._startMonkey()
             time.sleep(pollDelay)
             if not self._runSetupCmd(["forward", "tcp:"+str(self._monkeyPortForward), "tcp:1080"]):
                 time.sleep(pollDelay)
@@ -3134,9 +3138,11 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
     def recvUiautomatorDump(self):
         remote_filename = "/sdcard/fmbtandroid-v.xml"
         self.pkill("monkey")
+        self._startMonkey()
         status, out, err = self.shellSOE(
             "rm -f %s && uiautomator dump %s >/dev/null && cat %s" %
             (remote_filename, remote_filename, remote_filename))
+        self._resetMonkey()
         if status == 0:
             return out
         else:
