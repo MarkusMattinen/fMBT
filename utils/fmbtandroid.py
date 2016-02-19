@@ -2263,12 +2263,14 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
     _m_host = os.getenv("FMBTANDROID_ADB_FORWARD_HOST", 'localhost')
     _m_port = int(os.getenv("FMBTANDROID_ADB_FORWARD_PORT", random.randint(20000, 29999)))
     _w_host = _m_host
+    _adb_port = os.getenv("FMBTANDROID_ADB_PORT", None)
+    _adb_host = os.getenv("FMBTANDROID_ADB_HOST", None)
 
     def __init__(self, serialNumber, **kwArgs):
         fmbtgti.GUITestConnection.__init__(self)
         self._serialNumber = serialNumber
-        self._adbPort = kwArgs.pop("adbPort", None)
-        self._adbHost = kwArgs.pop("adbHost", None)
+        self._adbPort = kwArgs.pop("adbPort", _AndroidDeviceConnection._adb_port)
+        self._adbHost = kwArgs.pop("adbHost", _AndroidDeviceConnection._adb_host)
         self._monkeyPortForward = kwArgs.pop(
             "adbForwardPort", _AndroidDeviceConnection._m_port)
         self._windowPortForward = kwArgs.pop(
