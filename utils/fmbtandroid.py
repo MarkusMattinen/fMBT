@@ -150,7 +150,7 @@ $ ssh -N -L10000:127.0.0.1:5037 \
          -L10002:127.0.0.1:10002 HOST &
 # Pass forwarded ports to the Device constructor
 import fmbtandroid
-d = fmbtandroid.Device(adbPort=10000, adbForwardPort=10001)
+d = fmbtandroid.Device(adbPort=10000, adbForwardPort=10001, adbHost=localhost)
 """
 
 DEVICE_INI_DEFAULTS = '''
@@ -315,15 +315,20 @@ _g_keyNames = set((
 sortItems = fmbtgti.sortItems
 
 _g_listDevicesCommand = [_g_adbExecutable, "devices"]
-def listSerialNumbers(adbPort=None):
+def listSerialNumbers(adbPort=None, adbHost=None):
     """
     Returns list of serial numbers of Android devices.
     Equivalent for "adb devices".
     """
     if adbPort:
-        command = [_g_adbExecutable, "-P", str(adbPort), "devices"]
+        adbPortArgs = ["-P", str(adbPort)]
     else:
-        command = _g_listDevicesCommand
+        adbPortArgs = []
+    if adbHost:
+        adbHostArgs = ["-H", str(adbHost)]
+    else:
+        adbHostArgs = []
+    command = [_g_adbExecutable] + adbPortArgs + adbHostArgs + ["devices"]
     status, output, err = _run(command, expectedExitStatus = [0, 127])
     if status == 127:
         raise FMBTAndroidError('adb not found in PATH. Check your Android SDK installation.')
@@ -355,7 +360,7 @@ class Device(fmbtgti.GUITestInterface):
     """
     _PARSE_VIEW_RETRY_LIMIT = 10
     def __init__(self, deviceName=None, iniFile=None, connect=True,
-                 monkeyOptions=[], adbPort=None, adbForwardPort=None,
+                 monkeyOptions=[], adbPort=None, adbForwardPort=None, adbHost=None,
                  uiautomatorDump=False,
                  **kwargs):
         """
@@ -403,6 +408,11 @@ class Device(fmbtgti.GUITestInterface):
                   default is FMBTANDROID_ADB_FORWARD_PORT, or
                   random ports if undefined.
 
+          adbHost (string, optional):
+                  Find and connect to devices via the ADB server that
+                  listens on adbHost. If not given, adb is executed
+                  without the host parameter (-H).
+
           monkeyOptions (list of strings, optional):
                   Extra command line options to be passed to Android
                   monkey on the device.
@@ -433,6 +443,8 @@ class Device(fmbtgti.GUITestInterface):
             adbPortArgs["adbPort"] = adbPort
         if adbForwardPort != None:
             adbPortArgs["adbForwardPort"] = adbForwardPort
+        if adbHost != None:
+            adbPortArgs["adbHost"] = adbHost
 
         fmbtgti.GUITestInterface.__init__(self, **kwargs)
 
@@ -457,7 +469,7 @@ class Device(fmbtgti.GUITestInterface):
         elif deviceName == "":
             # Connect to an unspecified device.
             # Go through devices in "adb devices".
-            potentialDevices = listSerialNumbers(adbPort=adbPort)
+            potentialDevices = listSerialNumbers(adbPort=adbPort, adbHost=adbHost)
 
             if potentialDevices == []:
                 raise AndroidDeviceNotFound('No devices found with "%s"' % (_g_listDevicesCommand,))
@@ -2283,6 +2295,7 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
         fmbtgti.GUITestConnection.__init__(self)
         self._serialNumber = serialNumber
         self._adbPort = kwArgs.pop("adbPort", None)
+        self._adbHost = kwArgs.pop("adbHost", None)
         self._monkeyPortForward = kwArgs.pop(
             "adbForwardPort", _AndroidDeviceConnection._m_port)
         self._windowPortForward = kwArgs.pop(
@@ -2321,6 +2334,7 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
         rv = {
             "adbPort": self._adbPort,
             "adbForwardPort": self._monkeyPortForward,
+            "adbHost": self._adbHost,
             "stopOnError": self._stopOnError,
             "monkeyOptions": self._monkeyOptions,
             "screencapArgs": self._screencapArgs,
@@ -2350,7 +2364,11 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
             adbPortArgs = ["-P", str(self._adbPort)]
         else:
             adbPortArgs = []
-        command = [_g_adbExecutable, "-s", self._serialNumber] + adbPortArgs
+        if self._adbHost:
+            adbHostArgs = ["-H", str(self._adbHost)]
+        else:
+            adbHostArgs = []
+        command = [_g_adbExecutable, "-s", self._serialNumber] + adbPortArgs + adbHostArgs
         if type(adbCommand) == list or type(adbCommand) == tuple:
             command.extend(adbCommand)
         else:
