@@ -1,7 +1,7 @@
 #!/usr/bin/env python2
 
 # fMBT, free Model Based Testing tool
-# Copyright (c) 2013, Intel Corporation.
+# Copyright (c) 2013-2016, Intel Corporation.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms and conditions of the GNU Lesser General Public License,
@@ -118,7 +118,8 @@ def _pythonCode(code):
         try:
             parser.suite(code.encode("utf8"))
             return "suite"
-        except SyntaxError:
+        except SyntaxError, e:
+            _pythonCode.lastError = e
             return None
 
 ########################################################################
@@ -161,6 +162,7 @@ def gestureToGti(gestureEventList):
     xDistance = 0
     yDistance = 0
     if el[0].pos != None:
+        firstX, firstY = el[0].pos
         lastX, lastY = el[0].pos
         for e in el[1:]:
             xDistance += abs(lastX - e.pos[0])
@@ -183,10 +185,10 @@ def gestureToGti(gestureEventList):
             elif xDistance < 3 * locQuantum:
                 if el[-1].pos[1] < el[0].pos[1]:
                     direction = "north"
-                    sdist = yDistance + (1-el[0].pos[1])
+                    sdist = (firstY - lastY) / firstY
                 else:
                     direction = "south"
-                    sdist = yDistance + el[0].pos[1]
+                    sdist = (lastY - firstY) / (1.0 - firstY)
                 # only y axis changed, we've got a swipe
                 return '.swipe((%.2f, %.2f), "%s", distance=%.2f)' % (
                     quantL(el[0].pos) + (direction,) +
@@ -194,10 +196,10 @@ def gestureToGti(gestureEventList):
             elif yDistance < 3 * locQuantum:
                 if el[-1].pos[0] < el[0].pos[0]:
                     direction = "west"
-                    sdist = xDistance + (1-el[0].pos[0])
+                    sdist = (firstX - lastX) / firstX
                 else:
                     direction = "east"
-                    sdist = xDistance + el[0].pos[0]
+                    sdist = (lastX - firstX) / (1.0 - firstX)
                 # only y axis changed, we've got a swipe
                 return '.swipe((%.2f, %.2f), "%s", distance=%.2f)' % (
                     quantL(el[0].pos) + (direction,) +
@@ -249,6 +251,7 @@ class MyScaleEvents(QtCore.QObject):
         self.attrowner  = attrowner
         self.mainwindow = mainwindow
         self.visibleTip = None
+        self.highlightedItems = []
         self.selTop, self.selLeft = None, None
     def changeScale(self, coefficient):
         self.attrowner.wheel_scale *= coefficient
@@ -286,6 +289,7 @@ class MyScaleEvents(QtCore.QObject):
     def eventToSelect(self, event):
         w = self.mainwindow
         if event.type() == QtCore.QEvent.MouseButtonPress:
+            self.highlightedItems = []
             w.drawRect(0, 0, 0, 0, clear=True)
             if w._selectingBitmap.startswith("fmbt-scripter://view-item-at-pos"):
                 view_supported, _ = w._fmbtEval("hasattr(%s, 'view')" % (w._sut,), silent=True)
@@ -305,6 +309,7 @@ class MyScaleEvents(QtCore.QObject):
                     for index, i in enumerate(reversed(items)):
                         w.drawRect(*i.bbox(), onOrig=False)
                         msgs.append(str(i))
+                    self.highlightedItems = items
                     log("\n".join(msgs))
             else:
                 self.selLeft, self.selTop = self.posToAbs(event.pos)
@@ -411,7 +416,15 @@ class MyScaleEvents(QtCore.QObject):
         return False
     def showScreenshotTooltip(self, event):
         # tooltip on screenshot view
+        QtGui.QToolTip.hideText()
         x, y = self.posToAbs(event.pos)
+        if hasattr(self, "highlightedItems"):
+            for item in self.highlightedItems:
+                if (item.bbox()[0] <= x <= item.bbox()[2] and
+                    item.bbox()[1] <= y <= item.bbox()[3]):
+                    if hasattr(item, "dumpProperties") and item.dumpProperties():
+                        QtGui.QToolTip.showText(event.globalPos(), item.dumpProperties())
+                        break
         xRel, yRel = self.posToRel(event.pos)
         self.mainwindow._screenshotCursorX = int(x)
         self.mainwindow._screenshotCursorY = int(y)
@@ -731,6 +744,17 @@ class SettingsDialog(QtGui.QDialog):
                 str(self.pathsBitmapPath.text()).strip() +
                 ":" + os.path.relpath(str(d), os.getcwd()))
 
+class fmbtscripter:
+    """fmbt-scripter extension components
+
+    fmbtscripter.MonitorDialog:
+        A periodically updating interactive dialog. Example:
+        mon = fmbtscripter.MonitorDialog()
+        mon.addTextMonitor(onUpdate=lambda w: w.setText(str(time.time)))
+    """
+    def __init__(self):
+        self.MonitorDialog = MonitorDialog
+
 class MainWindow(QtGui.QMainWindow):
     def __init__(self, parent=None):
         super(MainWindow, self).__init__(parent)
@@ -773,7 +797,8 @@ class MainWindow(QtGui.QMainWindow):
         self._updateScreenshotScheduled = False
         self._fmbtEnv = {
             "pydoc": pydoc,
-            "time": time
+            "time": time,
+            "fmbtscripter": fmbtscripter()
         }
         self._bitmapFileFormats = ["Portable network graphics (*.png)",
                                    "All files (*.*)"]
@@ -1459,7 +1484,9 @@ class MainWindow(QtGui.QMainWindow):
             autoSelected = True
             code = self.selectPythonStatement(highlight=False)
             if not _pythonCode(code):
-                log("this block is not valid Python code:\n" + code)
+                log("Syntax error in Python code block:\n" +
+                    str(_pythonCode.lastError) + "\n" +
+                    code.splitlines()[_pythonCode.lastError.lineno-1])
                 code = ""
         elif lineCount == "selection":
             autoSelected = False
@@ -2536,10 +2563,13 @@ class MainWindow(QtGui.QMainWindow):
                 bgPen = QtGui.QPen(QtGui.QColor(0, 0, 0), 1)
                 fgPen = QtGui.QPen(QtGui.QColor(128, 255, 128), 1)
             painter.setPen(bgPen)
-            painter.drawRect(x-2, y-2, w+4, h+4)
-            painter.drawRect(x, y, w, h)
+            if x-2 >= 0 and y-2 >= 0:
+                painter.drawRect(x-2, y-2, w+4, h+4)
+            if x >= 0 and y >= 0:
+                painter.drawRect(x, y, w, h)
             painter.setPen(fgPen)
-            painter.drawRect(x-1, y-1, w+2, h+2)
+            if x-1 >= 0 and y-1 >= 0:
+                painter.drawRect(x-1, y-1, w+2, h+2)
         self.updateScreenshotView()
 
     def setScripterCode(self, codeLineRegex, codeLinePrefix, code):
@@ -2866,6 +2896,76 @@ class PythonHighlighter(QtGui.QSyntaxHighlighter):
         # format always something
         if not highlightedRegions:
             self.setFormat(0, len(text), self.normalFormat)
+
+class MonitorDialog(QtGui.QDialog):
+    """Dialog for user-defined, periodically updating monitors.
+
+    Example: evaluate in fmbt-scripter (for instance, use "Run line"):
+
+        mon.addTextMonitor(
+            onUpdate=lambda w: w.setText(str(time.time())),
+            onClick=lambda w: sys.stdout.write('hello\n'))
+        mon.show()
+    """
+    def __init__(self, *args):
+        QtGui.QDialog.__init__(self, *args)
+        self.layout = QtGui.QGridLayout(self)
+        self._monitors = []
+        self._nextLine = 0
+        self._update_interval_s = 1.0
+        self._scheduleMonitorUpdate()
+
+    def _scheduleMonitorUpdate(self):
+        QtCore.QTimer.singleShot(int(self._update_interval_s * 1000),
+                                 self.updateMonitors)
+
+    def addTextMonitor(self, text=None, onUpdate=None, onClick=None, pos=None):
+        """Add a monitor to the monitor dialog.
+
+        Parameters:
+          text (string, optional):
+                  label for the monitor. If not given, onUpdate(w) should set it.
+
+          onUpdate (function that takes one parameter, optional):
+                  This function will be called periodically with a widget
+                  that has setText() and text() methods.
+
+          onClick (function that takes one parameter, optional):
+                  This function will be called when user clicks the monitor widget.
+                  Parameter has setText() and text() methods.
+
+          pos (integer pair (row, column), optional):
+                  Location of the monitor in the grid. The default is to
+                  add new monitors to the first column below existing monitors.
+        """
+        if onClick == None:
+            widget = QtGui.QLabel("", self)
+        else:
+            widget = QtGui.QPushButton("", self)
+        if text:
+            widget.setText(text)
+        if onClick:
+            if onUpdate:
+                widget.clicked.connect(lambda: (onClick(widget), onUpdate(widget)))
+            else:
+                widget.clicked.connect(lambda: (onClick(widget), ))
+        if pos == None:
+            pos = (self._nextLine, 0)
+        if pos[0] >= self._nextLine:
+            self._nextLine = pos[0] + 1
+        self.layout.addWidget(widget, *pos)
+        if onUpdate:
+            onUpdate(widget)
+        self._monitors.append((widget, onUpdate, onClick))
+
+    def updateMonitors(self):
+        for widget, onUpdate, _ in self._monitors:
+            if onUpdate:
+                try:
+                    onUpdate(widget)
+                except:
+                    pass
+        self._scheduleMonitorUpdate()
 
 class FindDialog(QtGui.QDialog):
     # TODO: needs refactoring. This dialog is common to

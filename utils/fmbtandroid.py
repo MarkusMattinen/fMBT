@@ -236,6 +236,7 @@ def _run(command, expectedExitStatus=None, timeout=None):
         shell = _g_useShell
     try:
         p = subprocess.Popen(command, shell=shell,
+                             stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE,
                              close_fds=_g_closeFds)
@@ -309,6 +310,8 @@ _g_keyNames = set((
     "VOLUME_UP", "W", "WINDOW", "X", "Y", "YEN", "Z",
     "ZENKAKU_HANKAKU", "ZOOM_IN", "ZOOM_OUT"))
 
+sortItems = fmbtgti.sortItems
+
 _g_listDevicesCommand = [_g_adbExecutable, "devices"]
 def listSerialNumbers(adbPort=None, adbHost=None):
     """
@@ -332,7 +335,8 @@ def listSerialNumbers(adbPort=None, adbHost=None):
     try: deviceLines = outputLines[outputLines.index("List of devices attached")+1:]
     except: deviceLines = []
 
-    deviceLines = [l for l in deviceLines if l.strip() != ""]
+    deviceLines = [l for l in deviceLines
+                   if l.strip() != "" and not l.startswith("*")]
 
     potentialDevices = [line.split()[0] for line in deviceLines]
 
@@ -468,6 +472,7 @@ class Device(fmbtgti.GUITestInterface):
             if potentialDevices == []:
                 raise AndroidDeviceNotFound('No devices found with "%s"' % (_g_listDevicesCommand,))
 
+            errorMessages = []
             for deviceName in potentialDevices:
                 try:
                     self.setConnection(_AndroidDeviceConnection(
@@ -475,10 +480,12 @@ class Device(fmbtgti.GUITestInterface):
                     self._conf.set("general", "serial", self.serialNumber)
                     break
                 except AndroidConnectionError, e:
+                    errorMessages.append(str(e))
                     continue
             else:
-                raise AndroidConnectionError("Could not connect to device(s): %s." % (
-                        ", ".join(potentialDevices)))
+                raise AndroidConnectionError("Could not connect to device(s): %s. (%s)" % (
+                    ", ".join(potentialDevices),
+                    ", ".join(errorMessages)))
 
             # Found a device (deviceName).
             self._loadDeviceAndTestINIs(self._fmbtAndroidHomeDir, deviceName, iniFile)
@@ -669,7 +676,7 @@ class Device(fmbtgti.GUITestInterface):
             delayBeforeMoves == None and
             delayAfterMoves == None and
             movePoints == None and
-            self.platformVersion() > "4.2"):
+            self.platformVersion() >= "4.3"):
             x1, y1 = self.intCoords((x1, y1))
             x2, y2 = self.intCoords((x2, y2))
             return self.existingConnection().sendSwipe(x1, y1, x2, y2)
@@ -1031,7 +1038,10 @@ class Device(fmbtgti.GUITestInterface):
             rotate = -ROTATION_DEGS[-rotate]
         elif rotate == None:
             if self._autoRotateScreenshot:
-                drot = self.displayRotation()
+                if not forcedScreenshot:
+                    drot = self.displayRotation()
+                else:
+                    drot = None
                 if drot != None:
                     return self.refreshScreenshot(forcedScreenshot, rotate=-drot)
         rv = fmbtgti.GUITestInterface.refreshScreenshot(self, forcedScreenshot, rotate)
@@ -1882,6 +1892,12 @@ class ViewItem(fmbtgti.GUIItem):
                 "indent = %d\n\tproperties = {\n\t\t%s\n\t})") % (
             len(self._children), self._className, self._code, self._indent,
             '\n\t\t'.join(['"%s": %s' % (key, p[key]) for key in sorted(p.keys())]))
+    def dumpProperties(self):
+        rv = []
+        if self._p:
+            for key in [k for k in sorted(self._p.keys()) if not "layout:" in k and not "padding:" in k and not "drawing:" in k]: # sorted(self._p.keys()): # [k for k in sorted(self._p.keys()) if not ":" in k]:
+                rv.append("%s=%s" % (key, self._p[key]))
+        return "\n".join(rv)
     def __str__(self):
         if self.text():
             text = ", text=%s" % (repr(self.text()),)
@@ -2473,7 +2489,11 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
             except Exception, e:
                 _, monkeyOutput, _ = self._runAdb(["shell", "cat /sdcard/fmbtandroid.monkey.outerr"],
                                                   timeout=_SHORT_TIMEOUT)
-                if "Error: Unknown option:" in monkeyOutput:
+                if "/sdcard/fmbtandroid.monkey.outerr: No such file or directory" in monkeyOutput:
+                    msg = 'cannot read/write /sdcard on device %s' % (self._serialNumber,)
+                    _adapterLog(msg)
+                    raise AndroidConnectionError(msg)
+                elif "Error: Unknown option:" in monkeyOutput:
                     uo = [l for l in monkeyOutput.splitlines() if "Error: Unknown option:" in l][0].split(":")[-1].strip()
                     _adapterLog('detected an unknown option for monkey: "%s". Disabling it.' % (uo,))
                     try:

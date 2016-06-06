@@ -18,6 +18,9 @@
 
 # This library implements pythonshare server functionality.
 
+# pylint: disable=C0103,C0111,C0301,R0201,R0903,W0122,W0212,W0703
+
+import cPickle
 import datetime
 import getopt
 import hashlib
@@ -29,8 +32,9 @@ import tempfile
 import thread
 import traceback
 import urlparse
-
 import pythonshare
+import Queue
+
 messages = pythonshare.messages
 client = pythonshare.client
 
@@ -42,12 +46,13 @@ opt_log_fd = None
 opt_allow_new_namespaces = True
 
 _g_wake_server_function = None
+_g_waker_lock = None
 
 def timestamp():
     if on_windows:
         rv = "%.6f" % (
-            (datetime.datetime.now() -
-             datetime.datetime(1970,1,1)).total_seconds(),)
+            (datetime.datetime.utcnow() -
+             datetime.datetime(1970, 1, 1)).total_seconds(),)
     else:
         rv = datetime.datetime.now().strftime("%s.%f")
     return rv
@@ -72,6 +77,10 @@ def code2string(code):
 def exception2string(exc_info):
     return ''.join(traceback.format_exception(*exc_info))
 
+def _store_return_value(func, queue):
+    while True:
+        queue.put(func())
+
 class Pythonshare_ns(object):
     """Pythonshare services inside a namespace
     """
@@ -79,6 +88,18 @@ class Pythonshare_ns(object):
         self.ns = ns
         self._on_disconnect = []
         self._on_drop = []
+
+    def ns_type(self, ns):
+        """Query the type of a namespace.
+
+        Returns "local" or "remote" if namespace exists, otherwise None.
+        """
+        if ns in _g_local_namespaces:
+            return "local"
+        elif ns in _g_remote_namespaces:
+            return "remote"
+        else:
+            return None
 
     def local_nss(self):
         """List local namespaces
@@ -226,8 +247,12 @@ def _drop_local_namespace(ns):
 
 def _drop_remote_namespace(ns):
     daemon_log('drop remote namespace "%s"' % (ns,))
-    ns_obj = _g_remote_namespaces[ns]
-    del _g_remote_namespaces[ns]
+    try:
+        rns = _g_remote_namespaces[ns]
+        del _g_remote_namespaces[ns]
+        rns.__del__()
+    except KeyError:
+        pass # already dropped
     # send notification to all connections in _g_namespace_exports[ns]?
 
 def _init_remote_namespace(ns, conn, to_remote, from_remote):
@@ -271,7 +296,10 @@ def _local_execute(exec_msg, conn_id=None):
         finally:
             _g_executing_pythonshare_conn_id = None
             if exec_msg.lock:
-                _g_local_namespace_locks[ns].release()
+                try:
+                    _g_local_namespace_locks[ns].release()
+                except thread.error:
+                    pass # already unlocked namespace
     else:
         code_exc = expr_exc = 'locking namespace "%s" failed' % (ns,)
     if isinstance(expr_rv, pythonshare.messages.Exec_rv):
@@ -286,7 +314,13 @@ def _local_async_execute(async_rv, exec_msg):
 def _remote_execute(ns, exec_msg):
     rns = _g_remote_namespaces[ns]
     pythonshare._send(exec_msg, rns.to_remote)
-    return pythonshare._recv(rns.from_remote)
+    try:
+        return pythonshare._recv(rns.from_remote)
+    except AttributeError:
+        # If another thread closes the connection between send/recv,
+        # cPickle.load() may raise "'NoneType' has no attribute 'recv'".
+        # Make this look like EOF (connection lost)
+        raise EOFError()
 
 def _connection_lost(conn_id, *closables):
     if closables:
@@ -345,7 +379,7 @@ def _serve_connection(conn, conn_opts):
             daemon_log("authentication failed due to socket error")
             auth_ok = False
     else:
-       auth_ok = True # no password required
+        auth_ok = True # no password required
 
     whitelist_local = conn_opts.get("whitelist_local", None)
 
@@ -354,7 +388,7 @@ def _serve_connection(conn, conn_opts):
             obj = pythonshare._recv(from_client)
             if opt_debug:
                 daemon_log("%s:%s => %s" % (peername + (obj,)))
-        except EOFError:
+        except (EOFError, pythonshare.socket.error):
             break
 
         if isinstance(obj, messages.Register_ns):
@@ -418,17 +452,68 @@ def _serve_connection(conn, conn_opts):
             if opt_debug:
                 daemon_log("%s:%s <= %s" % (peername + (exec_rv,)))
             try:
-                pythonshare._send(exec_rv, to_client)
+                try:
+                    pythonshare._send(exec_rv, to_client)
+                except (EOFError, socket.error):
+                    break
             except (TypeError, ValueError, cPickle.PicklingError): # pickling rv fails
                 exec_rv.expr_rv = messages.Unpicklable(exec_rv.expr_rv)
-                pythonshare._send(exec_rv, to_client)
+                try:
+                    pythonshare._send(exec_rv, to_client)
+                except (EOFError, socket.error):
+                    break
 
         elif isinstance(obj, messages.Server_ctl):
             if obj.command == "die":
-                _g_server_shutdown = True
-                if _g_wake_server_function:
-                    _g_wake_server_function()
-                break
+                ns = obj.args[0]
+                if ns in _g_remote_namespaces:
+                    try:
+                        rv = _remote_execute(ns, obj)
+                        if opt_debug:
+                            daemon_log("%s:%s <= %s" % (peername + (rv,)))
+                        pythonshare._send(rv, to_client)
+                    except (EOFError, socket.error): # connection lost
+                        daemon_log('connection lost to "%s"' % (ns,))
+                        _drop_remote_namespace(ns)
+                        break
+                else:
+                    _g_server_shutdown = True
+                    server_ctl_rv = messages.Server_ctl_rv(0, "shutting down")
+                    pythonshare._send(server_ctl_rv, to_client)
+                    if _g_wake_server_function:
+                        _g_wake_server_function()
+                    break
+            elif obj.command == "unlock":
+                try:
+                    ns = obj.args[0]
+                    if ns in _g_remote_namespaces:
+                        try:
+                            rv = _remote_execute(ns, obj)
+                        except (EOFError, socket.error): # connection lost
+                            daemon_log('connection lost to "%s"' % (ns,))
+                            _drop_remote_namespace(ns)
+                            break
+                    elif ns in _g_local_namespace_locks:
+                        try:
+                            _g_local_namespace_locks[ns].release()
+                            server_ctl_rv = messages.Server_ctl_rv(
+                                0, "%s unlocked" % (repr(ns),))
+                        except thread.error, e:
+                            server_ctl_rv = messages.Server_ctl_rv(
+                                1, "%s already unlocked" %
+                                (repr(ns),))
+                    elif ns in _g_local_namespaces:
+                        server_ctl_rv = messages.Server_ctl_rv(
+                            2, "namespace %s is not locked" % (repr(ns),))
+                    else:
+                        server_ctl_rv = messages.Server_ctl_rv(
+                            -1, "unknown namespace %s" % (repr(ns),))
+                    if opt_debug:
+                        daemon_log("%s:%s <= %s" % (peername + (server_ctl_rv,)))
+                    pythonshare._send(server_ctl_rv, to_client)
+                except Exception, e:
+                    if opt_debug:
+                        daemon_log("Exception in handling %s: %s" % (obj, e))
         else:
             daemon_log("unknown message type: %s in %s" % (type(obj), obj))
             pythonshare._send(messages.Auth_rv(False), to_client)
@@ -445,6 +530,7 @@ def start_server(host, port,
                  ns_init_import_export=[],
                  conn_opts={}):
     global _g_wake_server_function
+    global _g_waker_lock
     daemon_log("pid: %s" % (os.getpid(),))
 
     # Initialise, import and export namespaces
@@ -485,23 +571,40 @@ def start_server(host, port,
 
     if isinstance(port, int):
         def wake_server_function():
-            ss = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            ss.connect((host, port))
-            ss.close()
+            _g_waker_lock.release() # wake up server
         _g_wake_server_function = wake_server_function
+        _g_waker_lock = thread.allocate_lock()
+        _g_waker_lock.acquire() # unlocked
 
         # Start listening to the port
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if not on_windows:
+        try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except:
+            pass
         s.bind((host, port))
         s.listen(4)
+        event_queue = Queue.Queue()
+        thread.start_new_thread(_store_return_value, (s.accept, event_queue))
+        thread.start_new_thread(_store_return_value, (_g_waker_lock.acquire, event_queue))
+        if not sys.stdin.closed:
+            daemon_log("listening to stdin")
+            thread.start_new_thread(_store_return_value, (sys.stdin.readline, event_queue))
+        else:
+            daemon_log("not listening stdin")
         while 1:
-            conn, _ = s.accept()
-            if _g_server_shutdown:
+            event = event_queue.get()
+            if isinstance(event, tuple):
+                # returned from s.accept
+                conn, _ = event
+                thread.start_new_thread(_serve_connection, (conn, conn_opts))
+            elif event == True:
+                # returned from _g_waker_lock.acquire
                 daemon_log("shutting down.")
                 break
-            thread.start_new_thread(_serve_connection, (conn, conn_opts))
+            else:
+                # returned from sys.stdin.readline
+                pass
     elif port == "stdin":
         opt_debug_stdout_limit = 0
         conn = client.Connection(sys.stdin, sys.stdout)

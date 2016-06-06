@@ -49,6 +49,7 @@ import os
 import pythonshare
 import shutil
 import subprocess
+import time
 import zlib
 
 try:
@@ -149,10 +150,7 @@ SW_RESTORE       = 9
 SW_DEFAULT       = 10
 SW_FORCEMINIMIZE = 11
 
-_g_showCmds = [
-    "SW_HIDE", "SW_NORMAL", "SW_MINIMIZED", "SW_MAXIMIZE", "SW_NOACTIVATE",
-    "SW_SHOW", "SW_MINIMIZE", "SW_MINNOACTIVE", "SW_SHOWNA", "SW_RESTORE",
-    "SW_DEFAULT", "SW_FORCEMINIMIZE"]
+sortItems = fmbtgti.sortItems
 
 class ViewItem(fmbtgti.GUIItem):
     def __init__(self, view, itemId, parentId, className, text, bbox, dumpFilename,
@@ -162,8 +160,29 @@ class ViewItem(fmbtgti.GUIItem):
         self._parentId = parentId
         self._className = className
         self._text = text
-        self._properties = rawProperties # dictionary or None
+        if rawProperties:
+            self._properties = rawProperties
+        else:
+            self._properties = {}
         fmbtgti.GUIItem.__init__(self, self._className, bbox, dumpFilename)
+
+    def branch(self):
+        """Returns list of view items from the root down to this item
+
+        Note: works only for UIAutomation backend"""
+        if not self._view._viewSource == "uiautomation":
+            raise NotImplementedError(
+                "branch() works only for uiautomation at the moment")
+        rv = []
+        itemId = self._itemId
+        while itemId:
+            rv.append(self._view._viewItems[itemId])
+            if itemId in self._view._viewItems:
+                itemId = self._view._viewItems[itemId]._parentId
+            else:
+                itemId = None
+        rv.reverse()
+        return rv
 
     def children(self):
         if self._view._viewSource == "enumchildwindows":
@@ -177,6 +196,12 @@ class ViewItem(fmbtgti.GUIItem):
 
     def parent(self):
         return self._parentId
+
+    def parentItem(self):
+        try:
+            return self._view._viewItems[self._parentId]
+        except KeyError:
+            return None
 
     def id(self):
         return self._itemId
@@ -198,10 +223,15 @@ class ViewItem(fmbtgti.GUIItem):
         return "ViewItem(%s)" % (self._view._dumpItem(self),)
 
 class View(object):
-    def __init__(self, dumpFilename, itemTree):
+    def __init__(self, dumpFilename, itemTree, itemOnScreen=None):
         self._dumpFilename = dumpFilename
         self._itemTree = itemTree
+        self._rootItem = None
         self._viewItems = {}
+        if itemOnScreen == None:
+            self._itemOnScreen = lambda item: True
+        else:
+            self._itemOnScreen = itemOnScreen
         if isinstance(itemTree, dict):
             # data from enumchildwindows:
             self._viewSource = "enumchildwindows"
@@ -225,8 +255,9 @@ class View(object):
                     bbox = [int(coord) for coord in bboxString.split(bboxSeparator)]
                     bbox[2] = bbox[0] + bbox[2] # width to right
                     bbox[3] = bbox[1] + bbox[3] # height to bottom
+                    bbox = tuple(bbox)
                 except Exception, e:
-                    bbox = [0, 0, 0, 0]
+                    bbox = (0, 0, 0, 0)
                 text = elt.get("Value", "")
                 if text == "":
                     text = elt.get("Name", "")
@@ -237,7 +268,7 @@ class View(object):
                     bbox,
                     dumpFilename,
                     elt)
-                self._viewItems[elt["hash"]] = vi
+                self._viewItems[int(elt["hash"])] = vi
                 if vi.parent() == 0:
                     self._rootItem = vi
             if not self._rootItem:
@@ -275,45 +306,46 @@ class View(object):
     def __str__(self):
         return "View(%s, %s items)" % (repr(self._dumpFilename), len(self._viewItems))
 
-    def findItems(self, comparator, count=-1, searchRootItem=None, searchItems=None):
+    def findItems(self, comparator, count=-1, searchRootItem=None, searchItems=None, onScreen=False):
         foundItems = []
         if count == 0: return foundItems
         if searchRootItem != None:
-            if comparator(searchRootItem):
+            if comparator(searchRootItem) and (
+                    not onScreen or (self._itemOnScreen(searchRootItem))):
                 foundItems.append(searchRootItem)
             for c in searchRootItem.children():
-                foundItems.extend(self.findItems(comparator, count=count-len(foundItems), searchRootItem=c))
+                foundItems.extend(self.findItems(comparator, count=count-len(foundItems), searchRootItem=c, onScreen=onScreen))
         else:
             if searchItems:
                 domain = iter(searchItems)
             else:
                 domain = self._viewItems.itervalues
             for i in domain():
-                if comparator(i):
+                if comparator(i) and (not onScreen or (self._itemOnScreen(i))):
                     foundItems.append(i)
                     if count > 0 and len(foundItems) >= count:
                         break
         return foundItems
 
-    def findItemsByText(self, text, partial=False, count=-1, searchRootItem=None, searchItems=None):
+    def findItemsByText(self, text, partial=False, count=-1, searchRootItem=None, searchItems=None, onScreen=False):
         if partial:
             c = lambda item: (text in item._text)
         else:
             c = lambda item: (text == item._text)
-        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems)
+        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems, onScreen=onScreen)
 
-    def findItemsByClass(self, className, partial=False, count=-1, searchRootItem=None, searchItems=None):
+    def findItemsByClass(self, className, partial=False, count=-1, searchRootItem=None, searchItems=None, onScreen=False):
         if partial:
             c = lambda item: (className in item._className)
         else:
             c = lambda item: (className == item._className)
-        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems)
+        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems, onScreen=onScreen)
 
-    def findItemsById(self, itemId, count=-1, searchRootItem=None, searchItems=None):
-        c = lambda item: (itemId == item._itemId)
-        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems)
+    def findItemsById(self, itemId, count=-1, searchRootItem=None, searchItems=None, onScreen=False):
+        c = lambda item: (itemId == item._itemId or itemId == item.properties().get("AutomationId", None))
+        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems, onScreen=onScreen)
 
-    def findItemsByProperties(self, properties, count=-1, searchRootItem=None, searchItems=None):
+    def findItemsByProperties(self, properties, count=-1, searchRootItem=None, searchItems=None, onScreen=False):
         """
         Returns ViewItems where every property matches given properties
 
@@ -333,9 +365,9 @@ class View(object):
         """
         c = lambda item: 0 == len([key for key in properties
                                    if properties[key] != item.properties().get(key, None)])
-        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems)
+        return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems, onScreen=onScreen)
 
-    def findItemsByPos(self, pos, count=-1, searchRootItem=None, searchItems=None, onScreen=None):
+    def findItemsByPos(self, pos, count=-1, searchRootItem=None, searchItems=None, onScreen=False):
         """
         Returns list of ViewItems whose bounding box contains the position.
 
@@ -350,7 +382,7 @@ class View(object):
         """
         x, y = self._intCoords(pos)
         c = lambda item: (item.bbox()[0] <= x <= item.bbox()[2] and item.bbox()[1] <= y <= item.bbox()[3])
-        items = self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems)
+        items = self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems, onScreen=onScreen)
         # sort from smallest to greatest area
         area_items = [((i.bbox()[2] - i.bbox()[0]) * (i.bbox()[3] - i.bbox()[1]), i) for i in items]
         return [i for _, i in sorted(area_items)]
@@ -363,17 +395,20 @@ class View(object):
 
 
 class Device(fmbtgti.GUITestInterface):
-    def __init__(self, connspec, password=None, screenshotSize=(None, None), **kwargs):
+    def __init__(self, connspec=None, password=None, screenshotSize=(None, None),
+                 connect=True, **kwargs):
         """Connect to windows device under test.
 
         Parameters:
 
-          connspec (string):
+          connspec (string or None, optional):
                   specification for connecting to a pythonshare
                   server that will run fmbtwindows-agent. The format is
-                  "socket://<host>[:<port>]".
+                  "[socket://][password@]<host>[:<port>][/namespace]".
+                  The default is None: run the agent on host, do not
+                  connect to a pythonshare server (works only on Windows).
 
-          password (optional, string or None):
+          password (string or None, optional):
                   authenticate to pythonshare server with given
                   password. The default is None (no authentication).
 
@@ -381,6 +416,10 @@ class Device(fmbtgti.GUITestInterface):
                   rotate new screenshots by rotateScreenshot degrees.
                   Example: rotateScreenshot=-90. The default is 0 (no
                   rotation).
+
+          connect (boolean, optional):
+                  Immediately establish connection to the device. The
+                  default is True.
 
         To prepare a windows device for connection, launch there
 
@@ -391,16 +430,50 @@ class Device(fmbtgti.GUITestInterface):
         """
         fmbtgti.GUITestInterface.__init__(self, **kwargs)
         self._viewSource = _g_viewSources[1]
+        self._viewItemProperties = None
+        self._lastView = None
+        self._lastViewStats = {}
+        self._refreshViewRetryLimit = 1
         self._connspec = connspec
         self._password = password
-        self.setConnection(WindowsConnection(
-            self._connspec, self._password))
+        if connect:
+            self.setConnection(WindowsConnection(
+                self._connspec, self._password))
+        else:
+            self.setConnection(None)
+
+    def closeWindow(self, window):
+        """
+        Send WM_CLOSE to window
+
+        Parameters:
+
+          window (window title (string) or handle (integer)):
+                  window to which the command will be sent.
+
+        Returns True on success, otherwise False.
+        """
+        return self.existingConnection().sendCloseWindow(window)
 
     def existingView(self):
         if self._lastView:
             return self._lastView
         else:
             raise FMBTWindowsError("view is not available. Missing refreshView()?")
+
+    def fileProperties(self, filepath):
+        """
+        Returns file properties as a dictionary.
+
+        Parameters:
+          filepath (string):
+                  full path to the file.
+        """
+        escapedFilename = filepath.replace('/', '\\').replace('\\', r'\\\\')
+        return self.existingConnection().evalPython(
+            '''wmicGet("datafile",'''
+            '''componentArgs=("where", "name='%s'"))''' %
+            escapedFilename)
 
     def getFile(self, remoteFilename, localFilename=None):
         """
@@ -434,11 +507,81 @@ class Device(fmbtgti.GUITestInterface):
         """
         return self._conn.recvMatchingPaths(pathnamePattern)
 
+    def getClipboard(self):
+        """
+        Returns clipboard contents in text format.
+
+        See also: setClipboard()
+        """
+        return self.existingConnection().evalPython("getClipboardText()")
+
+    def itemOnScreen(self, guiItem, relation="touch", topWindowBbox=None):
+        """
+        Returns True if bbox of guiItem is non-empty and on the screen
+
+        Parameters:
+
+          relation (string, optional):
+                  One of the following:
+                  - "overlap": item intersects the screen and the window.
+                  - "touch": mid point (the default touch point) of the item
+                             is within the screen and the window.
+                  - "within": the screen and the window includes the item.
+                  The default is "touch".
+        """
+        if guiItem.properties().get("IsOffscreen", False) == "True":
+            return False
+        if relation == "touch":
+            x1, y1, x2, y2 = guiItem.bbox()
+            if x1 == x2 or y1 == y2:
+                return False # a dimension is missing => empty item
+            itemBox = (guiItem.coords()[0], guiItem.coords()[1],
+                       guiItem.coords()[0] + 1, guiItem.coords()[1] + 1)
+            partial = True
+        elif relation == "overlap":
+            itemBox = guiItem.bbox()
+            partial = True
+        elif relation == "within":
+            itemBox = guiItem.bbox()
+            partial = False
+        else:
+            raise ValueError('invalid itemOnScreen relation: "%s"' % (relation,))
+        maxX, maxY = self.screenSize()
+        if topWindowBbox == None:
+            try:
+                topWindowBbox = self.topWindowProperties()['bbox']
+            except TypeError:
+                topWindowBbox = (0, 0, maxX, maxY)
+        return (fmbtgti._boxOnRegion(itemBox, (0, 0, maxX, maxY), partial=partial) and
+                fmbtgti._boxOnRegion(itemBox, topWindowBbox, partial=partial))
+
+    def kill(self, pid):
+        """
+        Terminate process
+
+        Parameters:
+
+          pid (integer):
+                  ID of the process to be terminated.
+        """
+        try:
+            return self.existingConnection().evalPython(
+                "kill(%s)" % (repr(pid),))
+        except:
+            return False
+
     def keyNames(self):
         """
         Returns list of key names recognized by pressKey
         """
         return sorted(_g_keyNames)
+
+    def osProperties(self):
+        """
+        Returns OS properties as a dictionary
+        """
+        return self.existingConnection().evalPython(
+            "wmicGet('os')")
 
     def pinch(self, (x, y), startDistance, endDistance,
               finger1Dir=90, finger2Dir=270, movePoints=20,
@@ -482,16 +625,20 @@ class Device(fmbtgti.GUITestInterface):
         x, y = self.intCoords((x, y))
 
         if type(startDistance) == float and 0.0 <= startDistance <= 1.0:
-            startDistanceInPixels = (startDistance *
-                                     max(fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger1Dir),
-                                         fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger2Dir)))
-        else: startDistanceInPixels = int(startDistance)
+            startDistanceInPixels = (
+                startDistance *
+                min(fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger1Dir),
+                    fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger2Dir)))
+        else:
+            startDistanceInPixels = int(startDistance)
 
         if type(endDistance) == float and 0.0 <= endDistance <= 1.0:
-            endDistanceInPixels = (endDistance *
-                                   max(fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger1Dir),
-                                       fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger2Dir)))
-        else: endDistanceInPixels = int(endDistance)
+            endDistanceInPixels = (
+                endDistance *
+                min(fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger1Dir),
+                    fmbtgti._edgeDistanceInDirection((x, y), self.screenSize(), finger2Dir)))
+        else:
+            endDistanceInPixels = int(endDistance)
 
         finger1startX = int(x + math.cos(math.radians(finger1Dir)) * startDistanceInPixels)
         finger1startY = int(y - math.sin(math.radians(finger1Dir)) * startDistanceInPixels)
@@ -561,13 +708,29 @@ class Device(fmbtgti.GUITestInterface):
         """
         return self._conn.sendFile(localFilename, remoteFilepath)
 
-    def reconnect(self):
+    def reconnect(self, connspec=None, password=None):
         """
         Close connections to the device and reconnect.
+
+        Parameters:
+
+          connspec (string, optional):
+                  Specification for new connection. The default is current
+                  connspec.
+
+          password (string, optional):
+                  Password for new connection. The default is current password.
         """
         self.setConnection(None)
         import gc
         gc.collect()
+        if connspec != None:
+            self._connspec = connspec
+        if password != None:
+            self._password = password
+        if self._connspec == None:
+            _adapterLog("reconnect failed: missing connspec")
+            return False
         try:
             self.setConnection(WindowsConnection(
                 self._connspec, self._password))
@@ -576,7 +739,7 @@ class Device(fmbtgti.GUITestInterface):
             _adapterLog("reconnect failed: %s" % (e,))
             return False
 
-    def refreshView(self, window=None, forcedView=None, viewSource=None):
+    def refreshView(self, window=None, forcedView=None, viewSource=None, items=[], properties=None):
         """
         (Re)reads widgets on the top window and updates the latest view.
 
@@ -594,7 +757,17 @@ class Device(fmbtgti.GUITestInterface):
                   "uiautomation" the UIAutomation framework.
                   "enumchildwindows" less data
                   but does not require UIAutomation.
-                  The default is "enumchildwindows".
+                  The default is "uiautomation".
+                  See also setViewSource().
+
+          items (list of view items, optional):
+                  update only contents of these items in the view.
+                  Works only for "uiautomation" view source.
+
+          properties (list of property names, optional):
+                  read only given properties from items, the default
+                  is to read all available properties.
+                  Works only for "uiautomation" view source.
                   See also setViewSource().
 
         Returns View object.
@@ -604,24 +777,88 @@ class Device(fmbtgti.GUITestInterface):
         if not viewSource in _g_viewSources:
             raise ValueError('invalid view source "%s"' % (viewSource,))
         if forcedView != None:
+            retryCount = 0
+            startTime = time.time()
+            lastStartTime = startTime
+            viewFilename = forcedView
             if isinstance(forcedView, View):
                 self._lastView = forcedView
             elif type(forcedView) in [str, unicode]:
-                self._lastView = View(forcedView,
-                                      ast.literal_eval(file(forcedView).read()))
+                try:
+                    self._lastView = View(forcedView, ast.literal_eval(file(viewFilename).read()))
+                except Exception:
+                    self._lastView = None
+            endTime = time.time()
         else:
             if self.screenshotDir() == None:
                 self.setScreenshotDir(self._screenshotDirDefault)
             if self.screenshotSubdir() == None:
                 self.setScreenshotSubdir(self._screenshotSubdirDefault)
             viewFilename = self._newScreenshotFilepath()[:-3] + "view"
-            if viewSource == "enumchildwindows":
-                viewData = self._conn.recvViewData(window)
-            else:
-                viewData = self._conn.recvViewUIAutomation(window)
-            file(viewFilename, "w").write(repr(viewData))
-            self._lastView = View(viewFilename, viewData)
+            retryCount = 0
+            startTime = time.time()
+            lastStartTime = startTime
+            while True:
+                try:
+                    topWindowBbox = self.topWindowProperties()['bbox']
+                except TypeError:
+                    topWindowBbox = None # top window unavailable
+                if viewSource == "enumchildwindows":
+                    viewData = self._conn.recvViewData(window)
+                else:
+                    if properties == None:
+                        properties = self._viewItemProperties
+                    viewData = self._conn.recvViewUIAutomation(
+                        window, items, properties)
+                file(viewFilename, "w").write(repr(viewData))
+                try:
+                    self._lastView = View(
+                        viewFilename, viewData,
+                        itemOnScreen=lambda i: self.itemOnScreen(i, topWindowBbox=topWindowBbox))
+                    break
+                except Exception, e:
+                    self._lastView = None
+                    _adapterLog(
+                        "refreshView %s failed (%s), source=%s topWindow=%s" %
+                        (retryCount, e, repr(viewSource), self.topWindow()))
+                    retryCount += 1
+                    if retryCount < self._refreshViewRetryLimit:
+                        time.sleep(0.2)
+                    else:
+                        break
+                lastStartTime = time.time()
+            endTime = time.time()
+        itemCount = -1
+        if self._lastView:
+            itemCount = len(self._lastView._viewItems)
+        self._lastViewStats = {
+            "retries": retryCount,
+            "timestamp": endTime,
+            "total time": endTime - startTime,
+            "last time": endTime - lastStartTime,
+            "filename": viewFilename,
+            "source": viewSource,
+            "forced": (forcedView != None),
+            "window": window,
+            "view": str(self._lastView),
+            "item count": itemCount}
         return self._lastView
+
+    def setClipboard(self, data):
+        """
+        Set text on clipboard
+
+        Parameters:
+
+          data (string):
+                  data to be set on the clipboard.
+
+        Note: any type of data on clipboard will be emptied.
+
+        See also: getClipboard()
+        """
+        return self.existingConnection().evalPython(
+            "setClipboardText(%s)" % (repr(data),))
 
     def setDisplaySize(self, size):
         """
@@ -663,6 +900,95 @@ class Device(fmbtgti.GUITestInterface):
         """
         return self.existingConnection().sendSetForegroundWindow(window)
 
+    def setRegistry(self, key, valueName, value, valueType=None):
+        """
+        Set Windows registry value.
+
+        Parameters:
+
+          key (string):
+                  full key name.
+
+          valueName (string):
+                  name of the value to be set.
+
+          value (string):
+                  string that specifies the new value.
+
+          valueType (string, optional for str and int values):
+                  REG_BINARY, REG_DWORD, REG_DWORD_LITTLE_ENDIAN,
+                  REG_DWORD_BIG_ENDIAN, REG_EXPAND_SZ, REG_LINK,
+                  REG_MULTI_SZ, REG_NONE, REG_RESOURCE_LIST or REG_SZ.
+                  Default types for storing str and int values
+                  are REG_SZ and REG_DWORD.
+
+        Example:
+          setRegistry(r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet"
+                       "\Control\Session Manager\Environment",
+                       "PATH", r"C:\MyExecutables", "REG_EXPAND_SZ")
+
+        Returns True on success.
+        """
+        return self.existingConnection().evalPython(
+            "setRegistry(%s,%s,%s,%s)" % (repr(key), repr(valueName),
+                                          repr(value), repr(valueType)))
+
+    def getRegistry(self, key, valueName):
+        """
+        Return Windows registry value and type
+
+        Parameters:
+
+          key (string):
+                  full key name.
+
+          valueName (string):
+                  name of the value to be read.
+
+        Returns a pair (value, valueType)
+
+        Example:
+          getRegistry(r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet"
+                       "\Control\Session Manager\Environment", "PATH")
+        """
+        return self.existingConnection().evalPython(
+            "getRegistry(%s,%s)" % (repr(key), repr(valueName)))
+
+    def processList(self):
+        """
+        Return list of processes running on the device.
+
+        Returns list of dictionaries with keys:
+          "pid": process ID, and
+          "ProcessImageFileName": full path to the executable in win32 format.
+        """
+        return self.existingConnection().evalPython("processList()")
+
+    def processStatus(self, pid):
+        """
+        Return status of a process
+
+        Parameters:
+
+          pid (integer):
+                  Process ID of the process
+
+        Returns properties in a dictionary.
+
+        Example:
+          print "Memory usage:", processStatus(4242)["WorkingSetSize"]
+        """
+        return self.existingConnection().evalPython(
+            "processStatus(%s)" % (repr(pid),))
+
+    def productList(self):
+        """
+        Return list of products installed or advertised in the system
+
+        Returns list of dictionaries, each containing properties of a product.
+        """
+        return self.existingConnection().evalPython("products()")
+
     def setScreenshotSize(self, size):
         """
         Force screenshots from device to use given resolution.
@@ -675,7 +1001,24 @@ class Device(fmbtgti.GUITestInterface):
         """
         self._conn.setScreenshotSize(size)
 
-    def setViewSource(self, source):
+    def setTopWindow(self, window):
+        """
+        Set a window as a foreground window and bring it to front.
+
+        Parameters:
+
+          window (title (string) or hwnd (integer):
+                  title or handle of the window to be raised
+                  foreground.
+
+        Returns True if the window was brought to the foreground,
+        otherwise False.
+
+        Notes: calls SetForegroundWindow in user32.dll.
+        """
+        return self.existingConnection().sendSetTopWindow(window)
+
+    def setViewSource(self, source, properties=None):
         """
         Set default view source for refreshView()
 
@@ -683,6 +1026,13 @@ class Device(fmbtgti.GUITestInterface):
 
           source (string):
                   default source, "enumchildwindow" or "uiautomation".
+
+          properties (string or list of strings, optional):
+                  set list of view item properties to be read.
+                  "all" reads all available properties for each item.
+                  "fast" reads a set of preselected properties.
+                  list of strings reads properties in the list.
+                  The default is "all".
 
         Returns None.
 
@@ -692,6 +1042,23 @@ class Device(fmbtgti.GUITestInterface):
             raise ValueError(
                 'invalid view source "%s", expected one of: "%s"' %
                 (source, '", "'.join(_g_viewSources)))
+        if properties != None:
+            if properties == "all":
+                self._viewItemProperties = None
+            elif properties == "fast":
+                self._viewItemProperties = ["AutomationId",
+                                            "BoundingRectangle",
+                                            "ClassName",
+                                            "HelpText",
+                                            "ToggleState",
+                                            "Value",
+                                            "Minimum",
+                                            "Maximum",
+                                            "Name"]
+            elif isinstance(properties, list) or isinstance(properties, tuple):
+                self._viewItemProperties = list(properties)
+            else:
+                raise ValueError('invalid properties, expected "all", "fast" or a list')
         self._viewSource = source
 
     def shell(self, command):
@@ -803,9 +1170,16 @@ class Device(fmbtgti.GUITestInterface):
 
         Returns True if successful, otherwise False.
         """
-        items = self.existingView().findItemsByText(text, partial=partial, count=1)
+        items = self.existingView().findItemsByText(text, partial=partial, count=1, onScreen=True)
         if len(items) == 0: return False
         return self.tapItem(items[0], **tapKwArgs)
+
+    def topWindow(self):
+        """
+        Returns a handle to the window.
+        """
+        return self.existingConnection().evalPython(
+            "ctypes.windll.user32.GetForegroundWindow()")
 
     def topWindowProperties(self):
         """
@@ -829,7 +1203,7 @@ class Device(fmbtgti.GUITestInterface):
                   the given text. The default is False (exact match).
         """
         assert self._lastView != None, "View required."
-        return self._lastView.findItemsByText(text, partial=partial, count=1) != []
+        return self._lastView.findItemsByText(text, partial=partial, count=1, onScreen=True) != []
 
     def viewSource(self):
         """
@@ -849,26 +1223,65 @@ class Device(fmbtgti.GUITestInterface):
         """
         return self._conn.recvWindowList()
 
-    def launchHTTPD(self):
+    def windowProperties(self, window):
         """
-        DEPRECATED, will be removed, do not use!
-        """
-        return self._conn.evalPython("launchHTTPD()")
+        Returns properties of a window.
 
-    def stopHTTPD(self):
+        Parameters:
+          window (title (string) or hwnd (integer):
+                  The window whose properties will be returned.
+
+        Returns properties in a dictionary.
         """
-        DEPRECATED, will be removed, do not use!
+        return self.existingConnection().recvWindowProperties(window)
+
+    def windowStatus(self, window):
         """
-        return self._conn.evalPython("stopHTTPD()")
+        Returns status of a window.
+
+        Parameters:
+          window (title (string) or hwnd (integer):
+                  The window whose properties will be returned.
+
+        Returns status in a dictionary.
+        """
+        return self.existingConnection().recvWindowStatus(window)
 
     def view(self):
         return self._lastView
+
+    def viewStats(self):
+        return self._lastViewStats
+
+class _NoPythonshareConnection(object):
+    """Fake Pythonshare connection, evaluate everything locally"""
+    def __init__(self, namespace="default"):
+        self._namespaces = {}
+        self._ns = namespace
+
+    def exec_in(self, ns, code):
+        if not ns in self._namespaces:
+            self._namespaces[ns] = {}
+        exec code in self._namespaces[ns]
+
+    def eval_in(self, ns, expr):
+        if not ns in self._namespaces:
+            self._namespaces[ns] = {}
+        return eval(expr, self._namespaces[ns])
+
+    def namespace(self):
+        return self._ns
 
 class WindowsConnection(fmbtgti.GUITestConnection):
     def __init__(self, connspec, password):
         fmbtgti.GUITestConnection.__init__(self)
         self._screenshotSize = (None, None) # autodetect
-        self._agent = pythonshare.connection(connspec, password=password)
+        if connspec != None:
+            self._agent = pythonshare.connect(connspec, password=password)
+        else:
+            if os.name != "nt":
+                raise ValueError("connecting to host works only on Windows")
+            self._agent = _NoPythonshareConnection()
         self._agent_ns = self._agent.namespace()
         agentFilename = os.path.join(
             os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe()))),
@@ -941,7 +1354,16 @@ class WindowsConnection(fmbtgti.GUITestConnection):
     def recvTopWindowProperties(self):
         return self.evalPython("topWindowProperties()")
 
+    def recvWindowProperties(self, window):
+        hwnd = self._window2hwnd(window)
+        return self.evalPython("windowProperties(%s)" % (hwnd,))
+
+    def recvWindowStatus(self, window):
+        hwnd = self._window2hwnd(window)
+        return self.evalPython("windowStatus(%s)" % (hwnd,))
+
     def recvViewData(self, window=None):
+        rv = None
         if window == None:
             rv = self.evalPython("topWindowWidgets()")
         elif isinstance(window, int):
@@ -958,21 +1380,41 @@ class WindowsConnection(fmbtgti.GUITestConnection):
             raise ValueError('illegal window "%s", expected integer or string (hWnd or title)' % (window,))
         return rv
 
-    def recvViewUIAutomation(self, window=None):
+    def recvViewUIAutomation(self, window=None, items=[], properties=None):
         """returns list of dictionaries, each of which contains properties of
         an item"""
-        dump = self.evalPython("dumpUIAutomationElements(%s)" % (repr(window),))
+        if properties == None:
+            properties = []
+        else:
+            # make sure certain properties are always included
+            propertySet = set(properties)
+            for must_be in ["BoundingRectangle"]:
+                propertySet.add(must_be)
+            properties = list(propertySet)
+        dumps = []
+        if items:
+            for item in items:
+                dumps.append(self.evalPython("dumpUIAutomationElements(%s, %s, %s)" % (
+                    repr(window),
+                    repr([str(item.id()) for item in item.branch()]),
+                    repr(properties))))
+        else:
+            dumps.append(self.evalPython("dumpUIAutomationElements(%s, %s, %s)" % (
+                repr(window),
+                repr([]),
+                repr(properties))))
         rv = []
         prop_data = {}
-        for prop_line in dump.splitlines():
-            if not "=" in prop_line:
-                continue
-            prop_name, prop_value = prop_line.split("=", 1)
-            if prop_name == "hash":
-                if prop_data:
-                    rv.append(prop_data)
-                    prop_data = {}
-            prop_data[prop_name] = prop_value.replace(r"\r\n", "\n").replace(r"\\", "\\")
+        for dump in dumps:
+            for prop_line in dump.splitlines():
+                if not "=" in prop_line:
+                    continue
+                prop_name, prop_value = prop_line.split("=", 1)
+                if prop_name == "hash":
+                    if prop_data:
+                        rv.append(prop_data)
+                        prop_data = {}
+                prop_data[prop_name] = prop_value.replace(r"\r\n", "\n").replace(r"\\", "\\")
         if prop_data:
             rv.append(prop_data)
         return rv
@@ -985,28 +1427,33 @@ class WindowsConnection(fmbtgti.GUITestConnection):
             windowList = self.recvWindowList()
             hwndList = [w["hwnd"] for w in windowList if w["title"] == window]
             if not hwndList:
-                raise ValueError('no window with title "%s"' % (title,))
+                raise ValueError('no window with title "%s"' % (window,))
             hwnd = hwndList[0]
-        elif isinstance(window, int):
+        elif isinstance(window, dict) and "hwnd" in window:
+            hwnd = window["hwnd"]
+        elif isinstance(window, int) or isinstance(window, long):
             hwnd = window
         else:
-            raise ValueError('invalid window "%s", string or integer expected' % (window,))
+            raise ValueError('invalid window "%s", string, integer or dict with "hwnd" key expected' % (window,))
         return hwnd
+
+    def sendCloseWindow(self, window):
+        hwnd = self._window2hwnd(window)
+        return self.evalPython("closeWindow(%s)" % (repr(hwnd),))
 
     def sendSetForegroundWindow(self, window):
         hwnd = self._window2hwnd(window)
         return 0 != self.evalPython("ctypes.windll.user32.SetForegroundWindow(%s)" %
                                     (repr(hwnd),))
 
+    def sendSetTopWindow(self, window):
+        hwnd = self._window2hwnd(window)
+        return 0 != self.evalPython("setTopWindow(%s)" %
+                                    (repr(hwnd),))
+
     def sendShowWindow(self, window, showCmd):
         hwnd = self._window2hwnd(window)
-        if isinstance(showCmd, str) or isinstance(showCmd, unicode):
-            if showCmd in _g_showCmds:
-                showCmd = _g_showCmds.index(showCmd)
-            else:
-                raise ValueError('invalid showCmd: "%s"' % (showCmd,))
-        return 0 != self.evalPython("ctypes.windll.user32.ShowWindow(%s, %s)" %
-                                    (repr(hwnd), repr(showCmd)))
+        return self.evalPython("showWindow(%s, %s)" % (repr(hwnd), repr(showCmd)))
 
     def sendType(self, text):
         command = 'sendType(%s)' % (repr(text),)
@@ -1069,7 +1516,8 @@ class WindowsConnection(fmbtgti.GUITestConnection):
         if button == None:
             command = "sendTouchUp(%s, %s)" % (x, y)
         else:
-            command = "sendMouseUp(%s, %s, %s)" % (x, y, button)
+            command = "(sendMouseMove(%s, %s, %s), sendMouseUp(%s))" % (
+                x, y, button, button)
         self._agent.eval_in(self._agent_ns, command)
         return True
 

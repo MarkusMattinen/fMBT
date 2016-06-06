@@ -203,9 +203,13 @@ def _intCoords((x, y), (width, height)):
     if 0 <= y <= 1 and type(y) == float: y = y * height
     return (int(round(x)), int(round(y)))
 
-def _boxOnRegion((x1, y1, x2, y2), (minX, minY, maxX, maxY)):
-    return (x1 < x2 and ((minX <= x1 <= maxX) or (minX <= x2 <= maxX)) and
-            y1 < y2 and ((minY <= y1 <= maxY) or (minY <= y2 <= maxY)))
+def _boxOnRegion((x1, y1, x2, y2), (minX, minY, maxX, maxY), partial=True):
+    if partial:
+        return (x1 < x2 and ((minX <= x1 <= maxX) or (minX <= x2 <= maxX)) and
+                y1 < y2 and ((minY <= y1 <= maxY) or (minY <= y2 <= maxY)))
+    else:
+        return (x1 < x2 and ((minX <= x1 <= maxX) and (minX <= x2 <= maxX)) and
+                y1 < y2 and ((minY <= y1 <= maxY) and (minY <= y2 <= maxY)))
 
 def _edgeDistanceInDirection((x, y), (width, height), direction):
     x, y = _intCoords((x, y), (width, height))
@@ -261,7 +265,19 @@ for _dirname in _libpath:
             ctypes.c_int,
             ctypes.c_double,
             ctypes.c_void_p]
+        eye4graphics.findNextDiff.restype = ctypes.c_int
+        eye4graphics.findNextDiff.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int]
+        eye4graphics.openImage.argtypes = [ctypes.c_char_p]
         eye4graphics.openImage.restype = ctypes.c_void_p
+        eye4graphics.openedImageDimensions.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         eye4graphics.closeImage.argtypes = [ctypes.c_void_p]
         break
     except: pass
@@ -286,6 +302,32 @@ def _e4gImageIsBlank(filename):
     eye4graphics.closeImage(e4gImage)
     return rv
 ### end of binding to eye4graphics.so
+
+def sortItems(items, criteria):
+    """
+    Returns GUIItems sorted according to given criteria
+
+    Parameters:
+      items (list of GUIItems):
+              items to be sorted
+
+      criteria (string):
+              Supported values:
+              "topleft" - sort by top left coordinates of items
+              "area" - sort by areas of items
+    """
+    if criteria == "topleft":
+        top_left_items = [(i.bbox()[1], i.bbox()[0], i) for i in items]
+        top_left_items.sort()
+        return [tli[2] for tli in top_left_items]
+    elif criteria == "area":
+        area_items = [
+            ((i.bbox()[2] - i.bbox()[0]) * (i.bbox()[3] - i.bbox()[1]), i)
+            for i in items]
+        area_items.sort()
+        return [ai[1] for ai in area_items]
+    else:
+        raise ValueError('invalid sort criteria "%s"' % (criteria,))
 
 class GUITestConnection(object):
     """
@@ -1425,39 +1467,51 @@ class GUITestInterface(object):
         """
         return self._conn
 
-    def drag(self, (x1, y1), (x2, y2), delayBetweenMoves=0.01, delayBeforeMoves=0, delayAfterMoves=0, movePoints=20):
+    def drag(self, (x1, y1), (x2, y2), delayBetweenMoves=0.01,
+             delayBeforeMoves=0, delayAfterMoves=0, movePoints=20,
+             button=_USE_DEFAULTS):
         """
         Touch the screen on coordinates (x1, y1), drag along straight
         line to coordinates (x2, y2), and raise fingertip.
 
-        coordinates (floats in range [0.0, 1.0] or integers):
-                floating point coordinates in range [0.0, 1.0] are
-                scaled to full screen width and height, others are
-                handled as absolute coordinate values.
+        Parameters:
 
-        delayBeforeMoves (float, optional):
-                seconds to wait after touching and before dragging.
-                If negative, starting touch event is not sent.
+          coordinates (floats in range [0.0, 1.0] or integers):
+                  floating point coordinates in range [0.0, 1.0] are
+                  scaled to full screen width and height, others are
+                  handled as absolute coordinate values.
 
-        delayBetweenMoves (float, optional):
-                seconds to wait when moving between points when
-                dragging.
+          delayBeforeMoves (float, optional):
+                  seconds to wait after touching and before dragging.
+                  If negative, starting touch event is not sent.
 
-        delayAfterMoves (float, optional):
-                seconds to wait after dragging, before raising
-                fingertip.
-                If negative, fingertip is not raised.
+          delayBetweenMoves (float, optional):
+                  seconds to wait when moving between points when
+                  dragging.
 
-        movePoints (integer, optional):
-                the number of intermediate move points between end
-                points of the line.
+          delayAfterMoves (float, optional):
+                  seconds to wait after dragging, before raising
+                  fingertip.
+                  If negative, fingertip is not raised.
+
+          movePoints (integer, optional):
+                  the number of intermediate move points between end
+                  points of the line.
+
+          button (integer, optional):
+                  send drag using given mouse button. The default is None.
 
         Returns True on success, False if sending input failed.
         """
         x1, y1 = self.intCoords((x1, y1))
         x2, y2 = self.intCoords((x2, y2))
+
+        extraArgs = {}
+        if button != _USE_DEFAULTS:
+            extraArgs["button"] = button
+
         if delayBeforeMoves >= 0:
-            if not self.existingConnection().sendTouchDown(x1, y1):
+            if not self.existingConnection().sendTouchDown(x1, y1, **extraArgs):
                 return False
         if delayBeforeMoves > 0:
             time.sleep(delayBeforeMoves)
@@ -1466,13 +1520,14 @@ class GUITestInterface(object):
         for i in xrange(0, movePoints):
             nx = x1 + int(round(((x2 - x1) / float(movePoints+1)) * (i+1)))
             ny = y1 + int(round(((y2 - y1) / float(movePoints+1)) * (i+1)))
-            if not self.existingConnection().sendTouchMove(nx, ny): return False
+            if not self.existingConnection().sendTouchMove(nx, ny, **extraArgs):
+                return False
             time.sleep(delayBetweenMoves)
         if delayAfterMoves > 0:
-            self.existingConnection().sendTouchMove(x2, y2)
+            self.existingConnection().sendTouchMove(x2, y2, **extraArgs)
             time.sleep(delayAfterMoves)
         if delayAfterMoves >= 0:
-            if self.existingConnection().sendTouchUp(x2, y2):
+            if self.existingConnection().sendTouchUp(x2, y2, **extraArgs):
                 return True
             else:
                 return False
@@ -2710,7 +2765,70 @@ class Screenshot(object):
         else:
             raise RuntimeError('Trying to use OIR on "%s" without OIR engine.' % (self.filename(),))
 
-    def findItemsByColor(self, rgb888, colorMatch=1.0, limit=1, area=None, invertMatch=False):
+    def findItemsByDiff(self, image, colorMatch=1.0, limit=1, area=None):
+        """
+        Return list of items that differ in this and the reference images
+
+        Parameters:
+
+          image (string):
+                  filename of reference image.
+
+          colorMatch (optional, float):
+                  required color matching accuracy. The default is 1.0
+                  (exact match)
+
+          limit (optional, integer):
+                  max number of matching items to be returned.
+                  The default is 1.
+        """
+        foundItems = []
+        closeImageA = False
+        closeImageB = False
+        self._notifyOirEngine()
+        try:
+            # Open imageA and imageB for comparison
+            if (self.filename() in getattr(self._oirEngine, "_openedImages", {})):
+                # if possible, use already opened image object
+                imageA = self._oirEngine._openedImages[self.filename()]
+            else:
+                imageA = _e4gOpenImage(self.filename())
+                closeImageA = True
+            imageB = _e4gOpenImage(image)
+            closeImageB = True
+
+            # Find differing pixels
+            bbox = _Bbox(-1, 0, 0, 0, 0)
+            while limit != 0:
+                found = eye4graphics.findNextDiff(
+                    ctypes.byref(bbox),
+                    ctypes.c_void_p(imageA),
+                    ctypes.c_void_p(imageB),
+                    ctypes.c_double(colorMatch),
+                    ctypes.c_double(1.0), # opacityLimit
+                    None, # searchAreaA
+                    None, # searchAreaB
+                    1)
+                if found != 1:
+                    break
+                rgbDiff = (bbox.error >> 16 & 0xff,
+                           bbox.error >> 8 & 0xff,
+                           bbox.error & 0xff)
+                foundItems.append(
+                    GUIItem("DIFF %s" %
+                            (rgbDiff,),
+                            (bbox.left, bbox.top, bbox.right, bbox.bottom),
+                            self))
+                limit -= 1
+        finally:
+            if closeImageA:
+                eye4graphics.closeImage(imageA)
+            if closeImageB:
+                eye4graphics.closeImage(imageB)
+        return foundItems
+
+    def findItemsByColor(self, rgb888, colorMatch=1.0, limit=1, area=None,
+                         invertMatch=False, group=""):
         """
         Return list of items that match given color.
 
@@ -2735,6 +2853,11 @@ class Screenshot(object):
           invertMatch (optional, boolean):
                   if True, search for items *not* matching the color.
                   The default is False.
+
+          group (optional, string):
+                  group matching pixels to large items. Accepted
+                  values are "adjacent" (group pixels that are next to
+                  each other) and "" (no grouping). The default is "".
         """
         self._notifyOirEngine()
         if (self.filename() in getattr(self._oirEngine, "_openedImages", {})):
@@ -2754,6 +2877,7 @@ class Screenshot(object):
                                   (0,))
         areaBbox = _Bbox(*leftTopRightBottomZero)
         foundItems = []
+        coord2item = {} # (x, y) -> viewItem
         try:
             while limit != 0:
                 found = eye4graphics.findNextColor(
@@ -2774,12 +2898,53 @@ class Screenshot(object):
                     comp = "!="
                 else:
                     comp = "=="
-                foundItems.append(
-                    GUIItem("RGB#%.2x%.2x%.2x%s%.2x%.2x%.2x (%s)" %
-                            (rgb888 + (comp,) + foundRgb + (colorMatch,)),
-                            (bbox.left, bbox.top, bbox.right, bbox.bottom),
-                            self))
-                limit -= 1
+                if not group:
+                    foundItems.append(
+                        GUIItem("RGB#%.2x%.2x%.2x%s%.2x%.2x%.2x (%s)" %
+                                (rgb888 + (comp,) + foundRgb + (colorMatch,)),
+                                (bbox.left, bbox.top, bbox.right, bbox.bottom),
+                                self))
+                    limit -= 1
+                elif group == "adjacent":
+                    x = bbox.left
+                    y = bbox.top
+                    itemA = None
+                    itemB = None
+                    if (x-1, y) in coord2item:
+                        # AAAx
+                        itemA = coord2item[(x-1, y)]
+                        if itemA._bbox[2] < x: # right < x
+                            itemA._bbox = (itemA._bbox[0], itemA._bbox[1], x, itemA._bbox[3])
+                        coord2item[(x, y)] = itemA
+                    if (x, y-1) in coord2item:
+                        # BBB
+                        # x
+                        itemB = coord2item[(x, y-1)]
+                        if itemB._bbox[3] < y: # bottom < y
+                            itemB._bbox = (itemB._bbox[0], itemB._bbox[1], itemB._bbox[2], y)
+                        coord2item[(x, y)] = itemB
+                        if itemA:
+                            #    BBB
+                            # AAAx
+                            if itemB != itemA:
+                                itemB._bbox = (min(itemA._bbox[0], itemB._bbox[0]),
+                                               min(itemA._bbox[1], itemB._bbox[1]),
+                                               max(itemA._bbox[2], itemB._bbox[2]),
+                                               max(itemA._bbox[3], itemB._bbox[3]))
+                                for ax in xrange(itemA._bbox[0], itemA._bbox[2]+1):
+                                    for ay in xrange(itemA._bbox[1], itemA._bbox[3]+1):
+                                        if coord2item.get((ax, ay), None) == itemA:
+                                            coord2item[(ax, ay)] = itemB
+                                foundItems.remove(itemA)
+                                limit += 1
+                    if not itemA and not itemB:
+                        itemA = GUIItem("RGB#%.2x%.2x%.2x%s%.2x%.2x%.2x (%s)" %
+                                (rgb888 + (comp,) + foundRgb + (colorMatch,)),
+                                (bbox.left, bbox.top, bbox.right, bbox.bottom),
+                                self)
+                        limit -= 1
+                        foundItems.append(itemA)
+                        coord2item[(x, y)] = itemA
         finally:
             if closeImage:
                 eye4graphics.closeImage(image)

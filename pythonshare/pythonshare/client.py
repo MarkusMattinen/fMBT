@@ -28,7 +28,7 @@ import socket
 import pythonshare
 from pythonshare.messages import \
     Exec, Exec_rv, Async_rv, Register_ns,\
-    Request_ns, Drop_ns, Ns_rv, Server_ctl
+    Request_ns, Drop_ns, Ns_rv, Server_ctl, Server_ctl_rv
 
 class Connection(object):
     """Connection to a Pythonshare server.
@@ -148,6 +148,8 @@ class Connection(object):
         an exception in remote end, respectively.
 
         """
+        if namespace == None:
+            namespace = self.namespace()
         try:
             pythonshare._send(Exec(namespace, code, expr, async=async, lock=lock), self._to_server)
             return self.make_local(pythonshare._recv(self._from_server))
@@ -246,7 +248,7 @@ class Connection(object):
 
           namespace (string)
                   Namespace to be dropped, can be local or
-                  remote to server.
+                  remote to the server.
 
         Returns True on success or raises an exception.
         """
@@ -257,13 +259,32 @@ class Connection(object):
         else:
             raise pythonshare.PythonShareError(rv.errormsg)
 
-    def poll_rvs(self, namespace):
-        """Poll available async return values from namespace.
+    def unlock_ns(self, namespace):
+        """Unlock namespace on the remote peer
 
         Parameters:
 
           namespace (string)
+                  Namespace to be unlocked, can be local or
+                  remote to the server.
+
+        Returns True on success or raises an exception.
+        """
+        pythonshare._send(Server_ctl("unlock", namespace), self._to_server)
+        rv = pythonshare._recv(self._from_server)
+        if isinstance(rv, Server_ctl_rv) and rv.status == 0:
+            return True
+        else:
+            raise pythonshare.PythonShareError(rv.message)
+
+    def poll_rvs(self, namespace=None):
+        """Poll available async return values from namespace.
+
+        Parameters:
+
+          namespace (string, optional)
                   namespace from which return values are queried.
+                  The default is returned by namespace().
 
         Example:
 
@@ -279,10 +300,23 @@ class Connection(object):
     def close(self):
         pythonshare._close(self._to_server, self._from_server, self._s)
 
-    def kill_server(self):
+    def kill_server(self, namespace=None):
         """Send server shutdown message"""
-        pythonshare._send(Server_ctl("die"), self._to_server)
+        if namespace == None:
+            namespace = self.namespace()
+        pythonshare._send(Server_ctl("die", namespace), self._to_server)
         return True
+
+    def ls_local(self):
+        """List local namespaces on the server"""
+        return self.eval_("pythonshare_ns.local_nss()")
+
+    def ls_remote(self):
+        """List remote namespaces on the server"""
+        return self.eval_("pythonshare_ns.remote_nss()")
+
+    def ns_type(self, ns):
+        return self.eval_("pythonshare_ns.ns_type(%s)" % (repr(ns),))
 
     def namespace(self):
         """Return default namespace"""

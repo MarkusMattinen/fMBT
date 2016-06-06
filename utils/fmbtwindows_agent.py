@@ -1,5 +1,5 @@
 # fMBT, free Model Based Testing tool
-# Copyright (c) 2014, Intel Corporation.
+# Copyright (c) 2014-2016, Intel Corporation.
 #
 # This program is free software; you can redistribute it and/or modify it
 # under the terms and conditions of the GNU Lesser General Public License,
@@ -15,12 +15,14 @@
 # 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
 
 import __builtin__
+import atexit
 import base64
 import ctypes
 import ctypes.wintypes
 import glob
 import os
 import Queue
+import signal
 import string
 import struct
 import subprocess
@@ -36,7 +38,32 @@ try:
 except:
     pass
 
-_mouse_input_area = (1920, 1080)
+try:
+    import _winreg
+    _REG_types = {
+        0: "REG_NONE",
+        1: "REG_SZ",
+        2: "REG_EXPAND_SZ",
+        3: "REG_BINARY",
+        4: "REG_DWORD",
+        5: "REG_DWORD_BIG_ENDIAN",
+        6: "REG_LINK",
+        7: "REG_MULTI_SZ",
+        8: "REG_RESOURCE_LIST",
+    }
+except:
+    _winreg = None
+    _REG_types = {}
+
+_g_rmAtExit = []
+def cleanUp():
+    for filename in _g_rmAtExit:
+        try:
+            os.remove(filename)
+        except:
+            pass
+atexit.register(cleanUp)
+
 _HTTPServerProcess = None
 
 INPUT_MOUSE                 = 0
@@ -287,12 +314,38 @@ KEY_X = 0x58
 KEY_Y = 0x59
 KEY_Z = 0x5A
 
+_g_showCmds = [
+    "SW_HIDE", "SW_NORMAL", "SW_MINIMIZED", "SW_MAXIMIZE", "SW_NOACTIVATE",
+    "SW_SHOW", "SW_MINIMIZE", "SW_MINNOACTIVE", "SW_SHOWNA", "SW_RESTORE",
+    "SW_DEFAULT", "SW_FORCEMINIMIZE"]
+
 LONG = ctypes.c_long
 DWORD = ctypes.c_ulong
 ULONG_PTR = ctypes.POINTER(DWORD)
 WORD = ctypes.c_ushort
+SIZE_T = ctypes.c_size_t
+HANDLE = ctypes.c_void_p
+
+try:
+    # Location of GetProcessMemoryInfo depends on Windows version
+    GetProcessMemoryInfo = ctypes.windll.kernel32.GetProcessMemoryInfo
+except AttributeError:
+    GetProcessMemoryInfo = ctypes.windll.psapi.GetProcessMemoryInfo
+
+PROCESS_QUERY_INFORMATION = 0x400
+PROCESS_TERMINATE = 0x1
+PROCESS_VM_READ = 0x10
 
 WM_GETTEXT = 0x000d
+WM_CLOSE = 0x0010
+
+CF_TEXT = 1
+CF_UNICODETEXT = 13
+
+
+GMEM_FIXED = 0x0000
+GMEM_MOVEABLE = 0x0002
+GMEM_ZEROINIT = 0x0040
 
 # Structs for mouse and keyboard input
 
@@ -355,6 +408,29 @@ class POINTER_TOUCH_INFO(ctypes.Structure):
               ("rcContactRaw", ctypes.wintypes.RECT),
               ("orientation", ctypes.c_uint32),
               ("pressure", ctypes.c_uint32)]
+
+class _PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    _fields_ = [("cb", DWORD),
+                ("PageFaultCount", DWORD),
+                ("PeakWorkingSetSize", SIZE_T),
+                ("WorkingSetSize", SIZE_T),
+                ("QuotaPeakPagedPoolUsage", SIZE_T),
+                ("QuotaPagedPoolUsage", SIZE_T),
+                ("QuotaPeakNonPagedPoolUsage", SIZE_T),
+                ("QuotaNonPagedPoolUsage", SIZE_T),
+                ("PagefileUsage", SIZE_T),
+                ("PeakPagefileUsage", SIZE_T),
+                ("PrivateUsage", SIZE_T)]
+
+# Allocate memory only once for often needed out-parameters
+
+_processMemoryCountersEx = _PROCESS_MEMORY_COUNTERS_EX()
+_filenameBufferW = ctypes.create_unicode_buffer(4096)
+_creationTime = ctypes.wintypes.FILETIME()
+_exitTime = ctypes.wintypes.FILETIME()
+_kernelTime = ctypes.wintypes.FILETIME()
+_userTime = ctypes.wintypes.FILETIME()
+_dword = DWORD(0)
 
 # Initialize Pointer and Touch info
 
@@ -430,7 +506,6 @@ def _sendTouch(pointerFlags, errorWhen="doTouch", fingers=1):
         success = 1
 
     if (success == 0):
-        print "%s error: %s" % (errorWhen, ctypes.FormatError())
         return False
     else:
         return True
@@ -444,7 +519,6 @@ def _touchHold():
         touchInfoLock.acquire()
         try:
             if not (touchInfo.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT):
-                print "touch: no more contact"
                 break
 
             if not _sendTouch(POINTER_FLAG_UPDATE  |
@@ -789,54 +863,75 @@ def windowWidgets(hwnd):
     ctypes.windll.user32.EnumChildWindows(hwnd, cb, hwnd)
     return widgets
 
-def _dumpTree(depth, key, wt):
-    for hwnd, parent, cname, text, rect in wt[key]:
-        print "%s%s (%s) cls='%s' text='%s' rect=%s" % (
-            " " * (depth*4), hwnd, parent, cname, text, rect)
-        if hwnd in wt:
-            _dumpTree(depth + 1, hwnd, wt)
-
-def dumpWidgets():
-    hwnd = topWindow()
-    wt = widgetList(hwnd)
-    _dumpTree(0, hwnd, wt)
-
-def dumpUIAutomationElements(window=None):
-    if window == None:
-        window = topWindow()
+def launchUIAutomationServer():
+    fromPath=[]
+    properties=[]
     powershellCode = r"""
 $assemblies = ('System', 'UIAutomationTypes', 'UIAutomationClient')
 
 $source = @'
 using System;
 using System.Windows.Automation;
+using System.Linq;
+using System.IO;
+using System.IO.Pipes;
 
 namespace FmbtWindows {
     public class UI {
-        public static void DumpElement(AutomationElement elt, Int32 parent=0) {
+        public static void DumpElement(AutomationElement elt, int depth, Int32 parent, int[] fromPath, string[] properties, StreamWriter outStream) {
+            string pValue;
             Int32 eltHash = elt.GetHashCode();
-            Console.WriteLine("");
-            Console.WriteLine("hash=" + eltHash);
-            Console.WriteLine("parent=" + parent.ToString());
+            if (fromPath.Length > depth) {
+                if (fromPath[depth] != eltHash)
+                    return;
+            }
+            outStream.WriteLine("");
+            outStream.WriteLine("hash=" + eltHash);
+            outStream.WriteLine("parent=" + parent.ToString());
             foreach (AutomationProperty p in elt.GetSupportedProperties()) {
                 string pName = p.ProgrammaticName.Substring(p.ProgrammaticName.IndexOf(".")+1);
                 if (pName.EndsWith("Property"))
                     pName = pName.Substring(0, pName.LastIndexOf("Property"));
-                string pValue = "" + elt.GetCurrentPropertyValue(p);
-                Console.WriteLine(pName + "=" + pValue.Replace("\\", "\\\\").Replace("\r\n", "\\r\\n"));
+                if (properties.Length == 1 || (properties.Length > 1 && properties.Contains(pName))) {
+                    pValue = "" + elt.GetCurrentPropertyValue(p);
+                    outStream.WriteLine(pName + "=" + pValue.Replace("\\", "\\\\").Replace("\r\n", "\\r\\n"));
+                }
             }
 
-            AutomationElement eltChild = TreeWalker.%(walker)sViewWalker.GetFirstChild(elt);
+            AutomationElement eltChild = TreeWalker.RawViewWalker.GetFirstChild(elt);
 
             while (eltChild != null) {
-                DumpElement(eltChild, eltHash);
-                eltChild = TreeWalker.%(walker)sViewWalker.GetNextSibling(eltChild);
+                DumpElement(eltChild, depth+1, eltHash, fromPath, properties, outStream);
+                eltChild = TreeWalker.RawViewWalker.GetNextSibling(eltChild);
             }
         }
 
-        public static void DumpWindow(UInt32 arg) {
+        public static void DumpWindow(UInt32 arg, string fromPathString, string properties, StreamWriter outStream) {
             IntPtr hwnd = new IntPtr(arg);
-            DumpElement(AutomationElement.FromHandle(hwnd));
+            int[] fromPath = Array.ConvertAll(fromPathString.Split(','), int.Parse);
+            DumpElement(AutomationElement.FromHandle(hwnd), 1, 0, fromPath, properties.Split(','), outStream);
+        }
+
+        public static void RunServer() {
+            while (true) {
+                NamedPipeServerStream pipeServer = new NamedPipeServerStream("fmbtwindows_uiautomation", PipeDirection.InOut);
+                pipeServer.WaitForConnection();
+                StreamReader sr = new StreamReader(pipeServer);
+
+                // read call parameters
+                UInt32 hwnd = UInt32.Parse(sr.ReadLine());
+                string fromPath = sr.ReadLine();
+                string properties = sr.ReadLine();
+
+                StreamWriter sw = new StreamWriter(pipeServer);
+                DumpWindow(hwnd, fromPath, properties, sw);
+
+                sw.WriteLine("end-of-dump-window");
+                sw.Flush();
+                sw.Close();
+                sr.Close();
+                pipeServer.Close();
+            }
         }
     }
 }
@@ -844,17 +939,215 @@ namespace FmbtWindows {
 
 Add-Type -ReferencedAssemblies $assemblies -TypeDefinition $source -Language CSharp
 
-[FmbtWindows.UI]::DumpWindow(%(window)s)
-""" % {"window": window, "walker": "Raw"}
-    # walker is "Raw", "Control" or "Content"
+[FmbtWindows.UI]::RunServer()
+"""
     fd, filename = tempfile.mkstemp(prefix="fmbtwindows-dumpwindow-", suffix=".ps1")
+    _g_rmAtExit.append(filename)
     try:
         os.write(fd, powershellCode)
         os.close(fd)
         run_script = ["powershell.exe", "-ExecutionPolicy", "Unrestricted", filename]
-        return _check_output(run_script)
+        server_process = subprocess.Popen(run_script)
+    except:
+        raise
+
+def dumpUIAutomationElements(window=None, fromPath=[], properties=[]):
+    if window == None:
+        window = topWindow()
+    f = None
+    serverLaunched = False
+    endTime = time.time() + 30
+    while f == None:
+        try:
+            f = open(r"\\.\pipe\fmbtwindows_uiautomation", "r+")
+            break
+        except IOError:
+            if not serverLaunched:
+                launchUIAutomationServer()
+                serverLaunched = True
+            time.sleep(0.5)
+            if time.time() > endTime:
+                raise Exception("dump timed out: cannot connect to uiautomation server")
+    f.write("%s\n%s\n%s\n" % (
+        window,
+        ",".join(["-1"] + fromPath),
+        ",".join(["nonemptylist"] + properties)))
+    f.flush()
+    rv = f.read()
+    f.close()
+    return rv
+
+def _openRegistryKey(key, accessRights):
+    firstKey = key.split("\\", 1)[0]
+    subKey = key[len(firstKey) + 1:]
+    HKEY = getattr(_winreg, firstKey, None)
+    if not firstKey.startswith("HKEY_") or HKEY == None:
+        raise ValueError("invalid HKEY_* at the beginning of the key %s" % (repr(key),))
+    regKey = _winreg.OpenKey(HKEY, subKey, 0, accessRights)
+    return regKey
+
+def kill(*pids):
+    rv = True
+    for pid in pids:
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if handle:
+            rv = rv and (ctypes.windll.kernel32.TerminateProcess(handle, -1) != 0)
+            ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            rv = False
+    return rv
+
+def processList():
+    retval = []
+    MAX_NUMBER_OF_PROCESSES = 1024 * 64
+    processIds = (MAX_NUMBER_OF_PROCESSES * DWORD)()
+    bytesReturned = DWORD()
+    if ctypes.windll.psapi.EnumProcesses(processIds,
+                                         ctypes.sizeof(processIds),
+                                         ctypes.byref(bytesReturned)) != 0:
+        for procIndex in xrange(bytesReturned.value / ctypes.sizeof(DWORD)):
+            processId = processIds[procIndex]
+            hProcess = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_INFORMATION, False, processId)
+            if hProcess:
+                bytesReturned.value = ctypes.sizeof(_filenameBufferW)
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                        hProcess,
+                        0, # Win32 path format
+                        ctypes.byref(_filenameBufferW),
+                        ctypes.byref(bytesReturned)) != 0:
+                    retval.append({
+                        "pid": int(processId),
+                        "ProcessImageFileName": _filenameBufferW.value})
+                ctypes.windll.kernel32.CloseHandle(hProcess)
+    return retval
+
+def processStatus(pid):
+    hProcess = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+
+    if hProcess == 0:
+        raise ValueError('cannot get status of process %s' % (pid,))
+
+    rv = {"pid": pid}
+
+    if GetProcessMemoryInfo(hProcess,
+                            ctypes.byref(_processMemoryCountersEx),
+                            ctypes.sizeof(_processMemoryCountersEx)) != 0:
+        for fieldName, fieldType in _processMemoryCountersEx._fields_:
+            if fieldName == "cb":
+                continue
+            rv[fieldName] = int(getattr(_processMemoryCountersEx, fieldName))
+
+    bytesReturned = DWORD()
+    bytesReturned.value = ctypes.sizeof(_filenameBufferW)
+    if ctypes.windll.kernel32.QueryFullProcessImageNameW(
+            hProcess,
+            0, # Win32 path format
+            ctypes.byref(_filenameBufferW),
+            ctypes.byref(bytesReturned)) != 0:
+        rv["ProcessImageFileName"] = _filenameBufferW.value
+
+    if ctypes.windll.kernel32.GetProcessTimes(
+            hProcess,
+            ctypes.byref(_creationTime),
+            ctypes.byref(_exitTime),
+            ctypes.byref(_kernelTime),
+            ctypes.byref(_userTime)) != 0:
+        rv["UserTime"] = ((_userTime.dwHighDateTime << 32) + _userTime.dwLowDateTime) / 10000000.0
+        rv["KernelTime"] = ((_kernelTime.dwHighDateTime << 32) + _kernelTime.dwLowDateTime) / 10000000.0
+
+    if ctypes.windll.kernel32.GetProcessHandleCount(
+            hProcess,
+            ctypes.byref(_dword)) != 0:
+        rv["HandleCount"] = int(_dword.value)
+
+    ctypes.windll.kernel32.CloseHandle(hProcess)
+    return rv
+
+def products(properties=("ProductName", "Publisher",
+                         "Version", "VersionString",
+                         "InstallDate", "InstallLocation",
+                         "InstallSource", "LocalPackage")):
+    retval = []
+    iProductIndex = 0
+    cchValueBuf = DWORD(0)
+    enumStatus = ctypes.windll.msi.MsiEnumProductsW(iProductIndex, _filenameBufferW)
+    while enumStatus == 0:
+        productCode = _filenameBufferW.value
+        productInfo = {"ProductCode": productCode}
+        for pname in properties:
+            cchValueBuf.value = ctypes.sizeof(_filenameBufferW)
+            if ctypes.windll.msi.MsiGetProductInfoW(
+                    productCode, unicode(pname), _filenameBufferW,
+                    ctypes.byref(cchValueBuf)) == 0:
+                productInfo[pname] = _filenameBufferW.value
+        retval.append(productInfo)
+        iProductIndex += 1
+        enumStatus = ctypes.windll.msi.MsiEnumProductsW(iProductIndex, _filenameBufferW)
+    return retval
+
+def setRegistry(key, valueName, value, valueType=None):
+    key = key.replace("/", "\\")
+    if not _winreg:
+        return False
+    if valueType == None:
+        if isinstance(value, basestring):
+            valueType = "REG_SZ"
+        elif isinstance(value, int) or isinstance(value, long):
+            valueType = "REG_DWORD"
+        else:
+            raise TypeError("valueType must be specified for value of %s" %
+                            (type(value),))
+    REG_type = getattr(_winreg, valueType, None)
+    if not valueType.startswith("REG_") or REG_type == None:
+        raise ValueError("invalid value type (REG_*): %s" % (repr(valueType),))
+    regKey = _openRegistryKey(key, _winreg.KEY_SET_VALUE)
+    _winreg.SetValueEx(regKey, valueName, 0, REG_type, value)
+    _winreg.CloseKey(regKey)
+    return True
+
+def getRegistry(key, valueName):
+    key = key.replace("/", "\\")
+    regKey = _openRegistryKey(key, _winreg.KEY_QUERY_VALUE)
+    value, valueType = _winreg.QueryValueEx(regKey, valueName)
+    _winreg.CloseKey(regKey)
+    return value, _REG_types.get(valueType, None)
+
+def getClipboardText():
+    if ctypes.windll.user32.IsClipboardFormatAvailable(CF_TEXT) == 0:
+        return None
+    if ctypes.windll.user32.OpenClipboard(0) == 0:
+        raise Exception("error in opening clipboard")
+    handle = ctypes.windll.user32.GetClipboardData(CF_TEXT)
+    if handle != 0:
+        string_p = ctypes.windll.kernel32.GlobalLock(handle)
+        try:
+            rv = ctypes.string_at(string_p)
+        finally:
+            ctypes.windll.kernel32.GlobalUnlock(handle)
+    else:
+        rv = None
+    ctypes.windll.user32.CloseClipboard()
+    return rv
+
+def setClipboardText(text):
+    ctypes.windll.user32.EmptyClipboard()
+    if ctypes.windll.user32.OpenClipboard(0) == 0:
+        raise Exception("error in opening clipboard")
+    handle = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(text)+1)
+    if handle == 0:
+        ctypes.windll.user32.CloseClipboard()
+        raise Exception("error in allocating global memory for text")
+    string_p = ctypes.windll.kernel32.GlobalLock(handle)
+    if string_p == 0:
+        ctypes.windll.user32.CloseClipboard()
+        raise Exception("error in locking global memory block")
+    try:
+        ctypes.memmove(string_p, text, len(text))
     finally:
-        os.remove(filename)
+        ctypes.windll.kernel32.GlobalUnlock(handle)
+    ctypes.windll.user32.SetClipboardData(CF_TEXT, handle)
+    ctypes.windll.user32.CloseClipboard()
 
 def _check_output(*args, **kwargs):
     """subprocess.check_output, for Python 2.6 compatibility"""
@@ -943,6 +1236,14 @@ def shellSOE(command, asyncStatus=None, asyncOut=None, asyncError=None):
         except: pass
     return status, out, err
 
+def showWindow(hwnd, showCmd):
+    if isinstance(showCmd, str) or isinstance(showCmd, unicode):
+        if showCmd in _g_showCmds:
+            showCmd = _g_showCmds.index(showCmd)
+        else:
+            raise ValueError('invalid showCmd: "%s"' % (showCmd,))
+    return 0 != ctypes.windll.user32.ShowWindow(hwnd, showCmd)
+
 def topWindow():
     return ctypes.windll.user32.GetForegroundWindow()
 
@@ -951,6 +1252,17 @@ def topWindowProperties():
     if not hwnd:
         return None
     return windowProperties(hwnd)
+
+def setTopWindow(hwnd):
+    status = windowStatus(hwnd)
+    if not status["visible"] or not status["foreground"]:
+        showWindow(hwnd, "SW_MINIMIZE")
+        showWindow(hwnd, "SW_RESTORE")
+    elif status["iconic"]:
+        showWindow(hwnd, "SW_RESTORE")
+    return (ctypes.windll.user32.SetForegroundWindow(hwnd) != 0 and
+            ctypes.windll.user32.BringWindowToTop(hwnd) != 0 and
+            topWindow() == hwnd)
 
 def windowProperties(hwnd):
     props = {'hwnd': hwnd}
@@ -962,19 +1274,27 @@ def windowProperties(hwnd):
     r = ctypes.wintypes.RECT()
     ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
 
+    pid = ctypes.c_uint(-1)
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
     props['title'] = titleBuf.value
     props['bbox'] = (r.left, r.top, r.right, r.bottom) # x1, y2, x2, y2
+    props['pid'] = int(pid.value)
     return props
 
-def launchHTTPD():
-    global _HTTPServerProcess
-    _HTTPServerProcess = subprocess.Popen("python -m SimpleHTTPServer 8000")
-    return True
+def windowStatus(hwnd):
+    status = {
+        "enabled": ctypes.windll.user32.IsWindowEnabled(hwnd) != 0,
+        "iconic": ctypes.windll.user32.IsIconic(hwnd) != 0,
+        "zoomed": ctypes.windll.user32.IsZoomed(hwnd) != 0,
+        "visible": ctypes.windll.user32.IsWindowVisible(hwnd) != 0,
+        "hung": ctypes.windll.user32.IsHungAppWindow(hwnd) != 0,
+        "foreground": ctypes.windll.user32.GetForegroundWindow() == hwnd
+    }
+    return status
 
-def stopHTTPD():
-    print "stopping " + str(_HTTPServerProcess)
-    _HTTPServerProcess.terminate()
-    return True
+def closeWindow(hwnd):
+    return ctypes.windll.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0
 
 def screenshotTakerThread():
     # Screenshots must be taken in the same thread. If BitBlt is
@@ -1031,8 +1351,6 @@ def screenshotTakerThread():
             _g_lastWidth = width
             _g_lastHeight = height
 
-        print "W x H ==", width, "X", height
-
         ctypes.windll.gdi32.SelectObject(memdc, bmp)
         ctypes.windll.gdi32.BitBlt(memdc, 0, 0, width, height, srcdc, left, top, SRCCOPY)
         got_bits = ctypes.windll.gdi32.GetDIBits(
@@ -1043,6 +1361,20 @@ def screenshotTakerThread():
         width, height = _g_screenshotRequestQueue.get()
 
     takerFree(srcdc, memdc, bmp)
+
+def wmicGet(component, componentArgs=()):
+    cmd = (["wmic", component] +
+           list(componentArgs) +
+           ["get", "/format:textvaluelist"])
+    s, o, e = shellSOE(cmd)
+    rv = {}
+    for l in o.splitlines():
+        try:
+            key, value = l.split("=", 1)
+        except ValueError:
+            continue
+        rv[key] = value
+    return rv
 
 if not "_mouse_input_area" in globals():
     left = ctypes.windll.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
@@ -1056,13 +1388,11 @@ if not "_mouse_input_area" in globals():
 if not "_g_touchInjenctionInitialized" in globals():
     try:
         if (ctypes.windll.user32.InitializeTouchInjection(2, 1) != 0):
-            print "Initialized Touch Injection"
             _g_touchInjenctionInitialized = True
         else:
-            print "InitializeTouchInjection failed"
+            pass
     except:
         _g_touchInjenctionInitialized = False
-        print "InitializeTouchInjection not supported"
 
 if not "_g_screenshotRequestQueue" in globals():
     # Initialize screenshot thread and communication channels

@@ -25,6 +25,12 @@ class Unpicklable(object):
     def __str__(self):
         return 'Unpicklable("%s")' % (self._string,)
 
+class Unloadable(object):
+    def __init__(self, obj):
+        self._string = str(obj)
+    def __str__(self):
+        return 'Unloadable("%s")' % (self._string,)
+
 class Auth_rv(object):
     def __init__(self, success, errormsg=""):
         self.success = success
@@ -96,8 +102,19 @@ class Ns_rv(object):
             self.status, errormsg)
 
 class Server_ctl(object):
-    def __init__(self, command):
+    def __init__(self, command, *args):
         self.command = command
+        self.args = args
     def __str__(self):
-        return 'Server_ctl(command="%s")' % (
-            self.command,)
+        return 'Server_ctl(command=%s, args=%s)' % (
+            repr(self.command),
+            repr(self.args))
+
+class Server_ctl_rv(object):
+    def __init__(self, status, message):
+        self.status = status
+        self.message = message
+    def __str__(self):
+        return 'Server_ctl_rv(status=%s, message=%s)' % (
+            repr(self.status),
+            repr(self.message))
