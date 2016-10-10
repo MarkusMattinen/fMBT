@@ -1,3 +1,5 @@
+# encoding: utf-8
+
 # fMBT, free Model Based Testing tool
 # Copyright (c) 2014, Intel Corporation.
 #
@@ -72,6 +74,8 @@ libX11.XDisplayKeycodes.argtypes = [
 
 libX11.XFlush.argtypes = [ctypes.c_void_p]
 
+libX11.XFree.argtypes = [ctypes.c_void_p]
+
 libX11.XGetGeometry.argtypes = [
     ctypes.c_void_p, ctypes.c_uint, # display, drawable
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, # root, x, y
@@ -98,6 +102,21 @@ libX11.XKeysymToKeycode.argtypes = [
 libX11.XRootWindow.argtypes = [
     ctypes.c_void_p, ctypes.c_int]
 libX11.XRootWindow.restype = ctypes.c_uint32
+
+libX11.XQueryTree.argtypes = [
+    ctypes.c_void_p, # display
+    ctypes.c_uint32, # window
+    ctypes.c_void_p, # root_return
+    ctypes.c_void_p, # parent_return
+    ctypes.c_void_p, # children_return
+    ctypes.c_void_p] # nchildren_return
+libX11.XQueryTree.restype = ctypes.c_int
+
+libX11.XFetchName.argtypes = [
+    ctypes.c_void_p, # display
+    ctypes.c_uint32, # window
+    ctypes.c_void_p] # window_name_return
+libX11.XFetchName.restype = ctypes.c_int
 
 libXtst.XTestFakeKeyEvent.argtypes = [
     ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
@@ -178,7 +197,9 @@ class Display(object):
             '*': "asterisk", '+': "plus", '-': "minus", '/': "slash",
             '.': "period", ',': "comma", ':': "colon", ';': "semicolon",
             '<': "less", '=': "equal", '>': "greater",
-            '?': "question", '@': "at"}
+            '?': "question", '@': "at",
+            u'å': "aring", u'ä': "adiaeresis", u'ö': "odiaeresis",
+            u'Å': "Aring", u'Ä': "Adiaeresis", u'Ö': "Odiaeresis"}
 
     def __del__(self):
         if self._display:
@@ -196,9 +217,13 @@ class Display(object):
         first = (keycode - self._cMinKeycode.value) * self._cKeysymsPerKeycode.value
 
         for modifier_index, modifier in enumerate([self._shiftModifier, None, None, self._level3Modifier]):
+            # see if a modifier is needed to produce a character
             if modifier == None: continue
             try:
-                if chr(self._keysyms[first + modifier_index + 1]) == origChar:
+                if isinstance(origChar, str) and chr(self._keysyms[first + modifier_index + 1]) == origChar:
+                    _modifiers.append(modifier)
+                    break
+                elif isinstance(origChar, unicode) and unichr(self._keysyms[first + modifier_index + 1]) == origChar:
                     _modifiers.append(modifier)
                     break
             except ValueError: pass
@@ -258,6 +283,87 @@ class Display(object):
             success = success and self.sendPress(character)
         return success
 
+    def recvWindowBbox(self, window, parentBbox=None):
+        rw = ctypes.c_uint32(0)
+        x = ctypes.c_int(0)
+        y = ctypes.c_int(0)
+        width = ctypes.c_uint(0)
+        height = ctypes.c_uint(0)
+        bwidth = ctypes.c_uint(0)
+        depth = ctypes.c_uint(0)
+        libX11.XGetGeometry(
+            self._display, window,
+            ctypes.byref(rw),
+            ctypes.byref(x), ctypes.byref(y),
+            ctypes.byref(width), ctypes.byref(height),
+            ctypes.byref(bwidth), ctypes.byref(depth))
+        if parentBbox == None:
+            parent = self.recvParentWindow(window)
+            if parent != 0:
+                parentBbox = self.recvWindowBbox(parent)
+            else:
+                parentBbox = (0, 0, 0, 0)
+        left = int(x.value + parentBbox[0])
+        top = int(y.value + parentBbox[1])
+        bbox = (left, top, int(left + width.value), int(top + height.value))
+        return bbox
+
+    def recvParentWindow(self, window):
+        root = ctypes.c_uint32(0)
+        parent = ctypes.c_uint32(0)
+        children = ctypes.POINTER(ctypes.c_uint32)()
+        nchildren = ctypes.c_int(0)
+        libX11.XQueryTree(self._display,
+                          window,
+                          ctypes.byref(root),
+                          ctypes.byref(parent),
+                          ctypes.byref(children),
+                          ctypes.byref(nchildren))
+        if children:
+            libX11.XFree(children)
+        return int(parent.value)
+
+    def recvChildWindows(self, window=None, recursive=True, parentBbox=None):
+        if window == None:
+            window = self._root_window
+        if parentBbox == None:
+            parentBbox = self.recvWindowBbox(window)
+        root = ctypes.c_uint32(0)
+        parent = ctypes.c_uint32(0)
+        children = ctypes.POINTER(ctypes.c_uint32)()
+        nchildren = ctypes.c_int(0)
+        libX11.XQueryTree(self._display,
+                          window,
+                          ctypes.byref(root),
+                          ctypes.byref(parent),
+                          ctypes.byref(children),
+                          ctypes.byref(nchildren))
+        windows = []
+        window_name = ctypes.c_char_p()
+        for c in xrange(nchildren.value):
+            if ctypes.sizeof(ctypes.c_void_p) == 4: # 32-bit
+                child = int(children[c])
+            else: # 64-bit
+                child = int(children[c*2])
+            libX11.XFetchName(self._display, child, ctypes.byref(window_name))
+            if window_name:
+                name = window_name
+            else:
+                name = None
+            bbox = self.recvWindowBbox(child, parentBbox=parentBbox)
+            window_dict = {
+                "window": child,
+                "parent": int(parent.value),
+                "name": window_name.value,
+                "bbox": bbox,
+            }
+            windows.append(window_dict)
+            libX11.XFree(window_name)
+            if recursive:
+                windows.extend(self.recvChildWindows(child, True, parentBbox=bbox))
+        libX11.XFree(children)
+        return windows
+
     def recvScreenshot(self, fmt="FMBTRAWX11"):
         image_p = libX11.XGetImage(self._display, self._root_window,
                                    0, 0, self._width, self._height,
@@ -273,7 +379,10 @@ class Display(object):
             compressed_image = rawfmbt_header + zlib.compress(rawfmbt_data, 3)
         elif fmt.upper() == "PNG" and fmbtpng != None:
             rawdata = ctypes.string_at(image.data, image.height * image.bytes_per_line)
-            compressed_image = fmbtpng.raw2png(rawdata, image.width, image.height, image.bits_per_pixel / 4, "BGR_")
+            if image.bits_per_pixel == 16:
+                compressed_image = fmbtpng.raw2png(rawdata, image.width, image.height, 5, "RGB565")
+            else:
+                compressed_image = fmbtpng.raw2png(rawdata, image.width, image.height, image.bits_per_pixel / 4, "BGR_")
         else:
             compressed_image = None
 
@@ -284,6 +393,7 @@ class Display(object):
         return None # optimization not implemented
 
 def shellSOE(command, username, asyncStatus, asyncOut, asyncError, usePty):
+    """run command as user, return (success, (exit status, output, error))"""
     if not username:
         username = _g_current_user
     if username != _g_current_user:
@@ -294,6 +404,7 @@ def shellSOE(command, username, asyncStatus, asyncOut, asyncError, usePty):
         else:
             spawn_command = command
         command = '''python -c "import pty; pty.spawn(%s)" ''' % (repr(spawn_command),)
+    in_child_process = False
     if (asyncStatus, asyncOut, asyncError) != (None, None, None):
         # prepare for decoupled asynchronous execution
         if asyncStatus == None: asyncStatus = "/dev/null"
@@ -301,13 +412,14 @@ def shellSOE(command, username, asyncStatus, asyncOut, asyncError, usePty):
         if asyncError == None: asyncError = "/dev/null"
         try:
             stdinFile = file("/dev/null", "r")
-            stdoutFile = file(asyncOut, "a+")
-            stderrFile = file(asyncError, "a+", 0)
-            statusFile = file(asyncStatus, "a+")
+            stdoutFile = file(asyncOut, "w")
+            stderrFile = file(asyncError, "w", 0)
+            statusFile = file(asyncStatus, "w")
         except IOError, e:
             return False, (None, None, e)
         try:
-            if os.fork() > 0:
+            in_child_process = (os.fork() == 0)
+            if not in_child_process:
                 # parent returns after successful fork, there no
                 # direct visibility to async child process beyond this
                 # point.
@@ -317,6 +429,10 @@ def shellSOE(command, username, asyncStatus, asyncOut, asyncError, usePty):
                 statusFile.close()
                 return True, (0, None, None)
         except OSError, e:
+            if in_child_process:
+                statusFile.write(str(e) + "\n")
+                statusFile.close()
+                sys.exit(0)
             return False, (None, None, e)
         os.setsid()
     else:
@@ -331,6 +447,10 @@ def shellSOE(command, username, asyncStatus, asyncOut, asyncError, usePty):
                              stderr=stderrFile,
                              close_fds=True)
     except Exception, e:
+        if in_child_process:
+            statusFile.write("127\n")
+            statusFile.close()
+            sys.exit(0)
         return False, (None, None, e)
     if asyncStatus == None and asyncOut == None and asyncError == None:
         # synchronous execution, read stdout and stderr
@@ -340,6 +460,8 @@ def shellSOE(command, username, asyncStatus, asyncOut, asyncError, usePty):
         statusFile.write(str(p.wait()) + "\n")
         statusFile.close()
         out, err = None, None
+    if in_child_process:
+        sys.exit(0) # child process ends here, do not return to pythonshare-server
     return True, (p.returncode, out, err)
 
 def atspiApplicationList():
@@ -356,9 +478,16 @@ def atspiAddItem(item, parent, foundItems):
     rv = {
         "id": itemId,
         "parent": repr(parent) if parent != None else None,
-        "class": item.get_role_name(),
-        "name": item.get_name(),
     }
+    try:
+        rv["role"] = item.get_role_name()
+    except:
+        rv["role"] = None
+    rv["class"] = rv["role"]
+    try:
+        rv["name"] = item.name
+    except:
+        rv["name"] = None
     try:
         bbox = item.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
         x, y, w, h = bbox
@@ -369,6 +498,10 @@ def atspiAddItem(item, parent, foundItems):
         rv["attributes"] = dict([a.split(':', 1) for a in item.getAttributes()])
     except:
         rv["attributes"] = None
+    try:
+        rv["description"] = item.description
+    except:
+        rv["description"] = None
     rv["actions"] = []
     try:
         actions = item.queryAction()

@@ -296,21 +296,35 @@ class MyScaleEvents(QtCore.QObject):
                 if not view_supported:
                     log("Platform does not support view items.")
                 else:
-                    if w._refreshedViewOnScreen != w._fmbtEval("%s.screenshot().filename()" %
-                                                               (w._sut,), silent=True)[0]:
-                        log("Reading view items...", prompt=False)
-                        self.mainwindow.repaint()
-                        w._fmbtEval("%s.refreshView()" % (w._sut,))
-                        w._refreshedViewOnScreen = w._fmbtEval("%s.screenshot().filename()" %
-                                                               (w._sut,), silent=True)[0]
-                    items, _ = w._fmbtEval("%s.view().findItemsByPos((%s, %s), onScreen=True)" %
-                                           ((w._sut,) + self.posToAbs(event.pos)))
-                    msgs = ["Items from large to small"]
-                    for index, i in enumerate(reversed(items)):
-                        w.drawRect(*i.bbox(), onOrig=False)
-                        msgs.append(str(i))
-                    self.highlightedItems = items
-                    log("\n".join(msgs))
+                    screenshotFilename = w._fmbtEval("%s.screenshot().filename()" %
+                                                     (w._sut,), silent=True)[0]
+                    if (w._fmbtEval("%s.view()" % (w._sut,), silent=True)[0]):
+                        viewFilename = w._fmbtEval("%s.view().filename()" %
+                                                   (w._sut,), silent=True)[0]
+                    else:
+                        viewFilename = ""
+                    if w._refreshedViewOnScreen != screenshotFilename:
+
+                        if viewFilename > screenshotFilename:
+                            w._refreshedViewOnScreen = screenshotFilename
+                            log("Showing view data from %s" % (repr(viewFilename),))
+                        else:
+                            log("Screenshot is newer than view, reading view items...", prompt=False)
+                            self.mainwindow.repaint()
+                            w._fmbtEval("%s.refreshView()" % (w._sut,))
+                            w._refreshedViewOnScreen = w._fmbtEval("%s.screenshot().filename()" %
+                                                                   (w._sut,), silent=True)[0]
+                    if w._fmbtEval("%s.view()" % (w._sut,), silent=True)[0] == None:
+                        log("No view.")
+                    else:
+                        items, _ = w._fmbtEval("%s.view().findItemsByPos((%s, %s), onScreen=True)" %
+                                               ((w._sut,) + self.posToAbs(event.pos)))
+                        msgs = ["Items from large to small"]
+                        for index, i in enumerate(reversed(items)):
+                            w.drawRect(*i.bbox(), onOrig=False)
+                            msgs.append(str(i))
+                        self.highlightedItems = items
+                        log("\n".join(msgs))
             else:
                 self.selLeft, self.selTop = self.posToAbs(event.pos)
         elif event.type() == QtCore.QEvent.MouseMove:
@@ -351,32 +365,6 @@ class MyScaleEvents(QtCore.QObject):
             coefficient = 1.0 + event.delta() / 1440.0
             self.changeScale(coefficient)
             return False
-        elif self.mainwindow.screenshotImageIndex == None:
-            return False
-        if event.type() == QtCore.QEvent.MouseMove:
-            if self.mainwindow.gestureStarted:
-                self.mainwindow.gestureEvents.append(
-                    GestureEvent("mousemove", None, self.posToRel(event.pos)))
-        elif event.type() == QtCore.QEvent.MouseButtonPress:
-            if not self.mainwindow.gestureStarted:
-                self.mainwindow.gestureStarted = True
-                self.mainwindow.gestureEvents = [
-                    GestureEvent("mousedown", 0, self.posToRel(event.pos))]
-        elif event.type() == QtCore.QEvent.MouseButtonRelease:
-            if self.mainwindow.gestureStarted:
-                self.mainwindow.gestureStarted = False
-                self.mainwindow.gestureEvents.append(
-                    GestureEvent("mouseup", 0, self.posToRel(event.pos)))
-                s = gestureToGti(self.mainwindow.gestureEvents)
-                cmd = self.mainwindow._sut + s
-                self.mainwindow.gestureEvents = []
-                if self.mainwindow.screenshotButtonControl.isChecked():
-                    debug("sending command %s" % (cmd,))
-                    self.mainwindow.runStatement(cmd)
-                else:
-                    debug("dropping command %s" % (cmd,))
-                if self.mainwindow.editorButtonRec.isChecked():
-                    self.mainwindow.insertRecordedCommand(cmd)
         elif event.type() == QtCore.QEvent.ToolTip:
             if not hasattr(self.attrowner, 'cursorForPosition'):
                 self.showScreenshotTooltip(event)
@@ -412,6 +400,33 @@ class MyScaleEvents(QtCore.QObject):
                                             '%s<br>not in bitmapPath' % (
                                                 filename,))
                 self.visibleTip = filepath
+        elif self.mainwindow.screenshotImageIndex == None:
+            return False
+        if event.type() == QtCore.QEvent.MouseMove:
+            if self.mainwindow.gestureStarted:
+                self.mainwindow.gestureEvents.append(
+                    GestureEvent("mousemove", None, self.posToRel(event.pos)))
+        elif event.type() == QtCore.QEvent.MouseButtonPress:
+            if not self.mainwindow.gestureStarted:
+                self.mainwindow.gestureStarted = True
+                self.mainwindow.gestureEvents = [
+                    GestureEvent("mousedown", 0, self.posToRel(event.pos))]
+        elif event.type() == QtCore.QEvent.MouseButtonRelease:
+            if self.mainwindow.gestureStarted:
+                self.mainwindow.gestureStarted = False
+                self.mainwindow.gestureEvents.append(
+                    GestureEvent("mouseup", 0, self.posToRel(event.pos)))
+                s = gestureToGti(self.mainwindow.gestureEvents)
+                cmd = self.mainwindow._sut + s
+                self.mainwindow.gestureEvents = []
+                if self.mainwindow.screenshotButtonControl.isChecked():
+                    debug("sending command %s" % (cmd,))
+                    self.mainwindow.runStatement(cmd)
+                else:
+                    debug("dropping command %s" % (cmd,))
+                if self.mainwindow.editorButtonRec.isChecked():
+                    self.mainwindow.insertRecordedCommand(cmd)
+
             return True
         return False
     def showScreenshotTooltip(self, event):
@@ -426,6 +441,9 @@ class MyScaleEvents(QtCore.QObject):
                         QtGui.QToolTip.showText(event.globalPos(), item.dumpProperties())
                         break
         xRel, yRel = self.posToRel(event.pos)
+        if xRel == None:
+            # cannot translate into image coordinates, do nothing
+            return
         self.mainwindow._screenshotCursorX = int(x)
         self.mainwindow._screenshotCursorY = int(y)
         self.mainwindow._screenshotCursorXRel = "%.2f" % (xRel,)
@@ -793,6 +811,8 @@ class MainWindow(QtGui.QMainWindow):
         self._screenshotCursorRGB = "N/A"
         self._screenshotErrorFilename = None
         self._scriptFilename = None
+        self._scriptFileOnDiskContent = None # original content on disk
+        self._scriptFileOnDiskName = None # file being watched on disk
         self._updateNextScreenshotFromFiles = []
         self._updateScreenshotScheduled = False
         self._fmbtEnv = {
@@ -1044,8 +1064,10 @@ class MainWindow(QtGui.QMainWindow):
             else:
                 self.console.append(msg)
             if self.consoleScrollCheck.isChecked():
-                sb = self.console.verticalScrollBar()
-                sb.setValue(sb.maximum())
+                vsb = self.console.verticalScrollBar()
+                vsb.setValue(vsb.maximum())
+                hsb = self.console.horizontalScrollBar()
+                hsb.setValue(hsb.minimum())
         _setGlobalLog(consoleLog)
 
         self.editorWidgetsLayout.addWidget(self.editorCombo)
@@ -1548,24 +1570,60 @@ class MainWindow(QtGui.QMainWindow):
             self.scheduleUpdateScreenshot(1.0)
         return exc == None
 
+    def scriptFileOnDiskChanged(self, update=True):
+        """return True if script file has changed on disk"""
+        if not self._scriptFilename:
+            # script has no name
+            if update:
+                self._scriptFileOnDiskName = None
+                self._scriptFileOnDiskContent = None
+            return False
+        try:
+            onDiskContent = codecs.open(
+                self._scriptFilename, encoding="utf8").read()
+        except IOError:
+            return False
+        if self._scriptFileOnDiskName != self._scriptFilename:
+            # watching a file with old name, change watched name
+            if update:
+                self._scriptFileOnDiskName = self._scriptFilename
+                self._scriptFileOnDiskContent = onDiskContent
+            return False
+        elif self._scriptFileOnDiskContent == None:
+            # first time reading watched content
+            if update:
+                self._scriptFileOnDiskContent = onDiskContent
+            return False
+        elif self._scriptFileOnDiskContent == onDiskContent:
+            # no change
+            return False
+        else:
+            # file content has changed
+            if update:
+                self._scriptFileOnDiskContent = onDiskContent
+            return True
+
     def save(self):
+        if self.scriptFileOnDiskChanged():
+            reply = QtGui.QMessageBox.question(
+                _win, "fmbt-scripter",
+                '%s has changed on disk. Save changes?' % (
+                    self._scriptFilename,),
+                QtGui.QMessageBox.Save | QtGui.QMessageBox.Cancel)
+            if reply != QtGui.QMessageBox.Save:
+                return False
         if self._scriptFilename:
             codecs.open(self._scriptFilename, "w", encoding="utf8").write(
                 self.editor.toPlainText())
+            self.scriptFileOnDiskChanged(update=True)
         else:
             return self.saveAs()
 
     def newAndroid(self):
         try:
-            _, o, _ = fmbtandroid._run(["adb", "devices"], expectedExitStatus=0)
-        except fmbtandroid.FMBTAndroidRunError:
-            log("cannot connect to Android devices: adb not available")
-            return
-        outputLines = [l.strip() for l in o.splitlines() if l.strip() != ""]
-        try:
-            deviceLines = outputLines[
-                outputLines.index("List of devices attached")+1:]
-        except IndexError:
+            deviceLines = fmbtandroid.listSerialNumbers()
+        except fmbtandroid.FMBTAndroidError, e:
+            log(str(e))
             deviceLines = []
         serialNumber = ""
         if len(deviceLines) > 1:
@@ -1706,6 +1764,11 @@ class MainWindow(QtGui.QMainWindow):
         self._scriptFilename = newName
         self.setImportDir(str(self._scriptFilename))
         self.editorCursorPositionChanged()
+        if not self._scriptFilename:
+            self.setWindowTitle("fmbt-scripter")
+        else:
+            self.setWindowTitle("fmbt-scripter: %s" % (
+                os.path.basename(self._scriptFilename),))
 
     def saveAs(self):
         path = QtGui.QFileDialog.getSaveFileName(
@@ -1921,6 +1984,7 @@ class MainWindow(QtGui.QMainWindow):
         self.setScriptFilename(filepath)
         self.editor.setPlainText(
             codecs.open(self._scriptFilename, encoding="utf8").read())
+        self.scriptFileOnDiskChanged(update=True) # update file being watched
 
     def _fmbtExec(self, statement, silent=False):
         if not silent or opt_debug:

@@ -1,5 +1,5 @@
 Name:           fmbt
-Version:        0.33
+Version:        0.36
 Release:        1
 Summary:        free Model-Based Testing tool
 
@@ -269,6 +269,7 @@ rm -f $RPM_BUILD_ROOT/%{_libdir}/python*/site-packages/eye4graphics.la
 %{python_sitearch}/fmbtlogger.py*
 %{python_sitearch}/fmbtuinput.py*
 %{python_sitearch}/lsts.py*
+%{python_sitearch}/pycosh.py*
 %{python_sitearch}/aalmodel.py*
 %{python_sitearch}/%{name}_config.py*
 %{python_sitearch}/%{name}_python-*.egg-info

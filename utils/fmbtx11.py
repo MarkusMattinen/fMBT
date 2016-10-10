@@ -120,7 +120,7 @@ class View(object):
         for item in itemTree:
             className = item.get("class", "")
             text = item.get("text", "")
-            if text == "":
+            if text == "" or text == None:
                 text = item.get("name", "")
             if text == "":
                 text = className
@@ -192,7 +192,7 @@ class View(object):
 
     def findItemsByText(self, text, partial=False, count=-1, searchRootItem=None, searchItems=None, onScreen=False):
         if partial:
-            c = lambda item: (text in item._text)
+            c = lambda item: (text in item._text or text in item.properties()["name"])
         else:
             c = lambda item: (text == item._text)
         return self.findItems(c, count=count, searchRootItem=searchRootItem, searchItems=searchItems, onScreen=onScreen)
@@ -246,6 +246,12 @@ class View(object):
         area_items = [((i.bbox()[2] - i.bbox()[0]) * (i.bbox()[3] - i.bbox()[1]), i) for i in items]
         return [i for _, i in sorted(area_items)]
 
+    def items(self):
+        """
+        Returns list of all items in the view
+        """
+        return fmbtgti.sortItems(self._viewItems.values(), "topleft")
+
     def save(self, fileOrDirName):
         """
         Save view dump to a file.
@@ -273,11 +279,23 @@ class Screen(fmbtgti.GUITestInterface):
         self._refreshViewDefaults = {}
         self.setConnection(X11Connection(display))
 
+    def atspiApplicationList(self):
+        """Returns list of running ATSPI applications.
+
+        refreshView with view source "atspi" works for these
+        applications.
+        """
+        return fmbtx11_conn.atspiApplicationList()
+
     def existingView(self):
         if self._lastView:
             return self._lastView
         else:
             raise FMBTWindowsError("view is not available. Missing refreshView()?")
+
+    def itemOnScreen(self, guiItem):
+        maxX, maxY = self.screenSize()
+        return fmbtgti._boxOnRegion(guiItem.bbox(), (0, 0, maxX, maxY))
 
     def keyNames(self):
         return _keyNames[:]
@@ -291,9 +309,15 @@ class Screen(fmbtgti.GUITestInterface):
             viewSource = self._refreshViewDefaults.get("viewSource", "atspi")
         if viewSource == "atspi":
             foundItems = self.existingConnection().recvAtspiViewData(window)
+            if self.screenshotDir() == None:
+                self.setScreenshotDir(self._screenshotDirDefault)
+            if self.screenshotSubdir() == None:
+                self.setScreenshotSubdir(self._screenshotSubdirDefault)
             viewFilename = self._newScreenshotFilepath()[:-3] + "view"
             file(viewFilename, "w").write(repr(foundItems))
-            self._lastView = View(viewFilename, foundItems)
+            self._lastView = View(
+                viewFilename, foundItems,
+                itemOnScreen=lambda i: self.itemOnScreen(i))
         else:
             raise ValueError('viewSource "%s" not supported' % (viewSource,))
         return self._lastView
@@ -352,6 +376,16 @@ class Screen(fmbtgti.GUITestInterface):
 
     def view(self):
         return self._lastView
+
+    def windowList(self):
+        """
+        Return list of properties of windows (dictionaries)
+
+        Example: list window id's and names:
+          for props in screen.windowList():
+              print props["window"], props["name"]
+        """
+        return self.existingConnection().recvChildWindows(recursive=True)
 
 class X11Connection(fmbtx11_conn.Display):
     def __init__(self, display):

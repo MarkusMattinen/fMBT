@@ -1,3 +1,85 @@
+fmbt (0.36-1) unstable; urgency=low
+
+  * fmbtx11:
+    - Screen.refreshView() improved a lot.
+    - Screen.atspiApplicationList() added, lists applications from which
+      refreshView() can fetch accessibility data.
+    - Screen.windowList() added, lists X11 windows.
+    - More characters supported by Screen.type().
+  * pythonshare-server:
+    - Truncate debug data written to a log file with -D LENGTH.
+  * fmbt-scripter:
+    - Show variable values on tooltips also without screenshots.
+    - Ask user before saving a script if the file has changed on disk.
+  * fmbtwindows:
+    - Device.type() supports all characters on active keyboard layout.
+  * fmbtpng:
+    - improved compatibility with various libpng versions.
+  * pycosh:
+    - du [-h] added, shows disk usage
+  * Windows build script updated to use new Tesseract URL.
+
+ -- Antti Kervinen <antti.kervinen@intel.com>  Fri, 7 Oct 2016 14:42:00 +0300
+
+fmbt (0.35-1) unstable; urgency=low
+
+  * fmbtandroid:
+    - Support Android Nougat.
+    - Fix screen size issue on the latest Android 6.0.1.
+  * pythonshare:
+    - Use more efficient protocol on all transmissions. Makes fmbtwindows
+      and other pythonshare-based agents run faster.
+  * fmbtwindows:
+    - Device.getFile() parameter "compress" added, improves tranmission
+      speed if file data can be compressed.
+    - Support synthesizing mouse events on multiscreen setups.
+  * fmbtx11:
+    - Support screens with 16-bit color depth.
+    - Screen.shellSOE() async execution issue fixed.
+  * pycosh:
+    - df [-h] added, shows free disk space.
+    - unzip parameter "-d", sets destination directory.
+    - Runs also on hosts without user and/or hostname.
+
+ -- Antti Kervinen <antti.kervinen@intel.com>  Thu, 8 Sep 2016 09:42:00 +0300
+
+fmbt (0.34-1) unstable; urgency=low
+
+  * pycosh: introduced pico-sized pure-Python multiplatform shell.
+    - The shell brings tiny built-in implementations of the usual
+      goodies, including curl, find, diff, grep, head, kill, md5sum,
+      ps, sed, sort, tail, tar, unzip/zip and xxd.
+  * fmbtwindows:
+    - Device.pycosh() added for running pycosh commands on device.
+    - Device.rmFile() added for removing files on device.
+    - Device.shellSOE() has new cwd parameter for defining the current
+      working directory in which the command will be executed.
+    - Device.refreshView() has new area parameter. It often gives
+      significant performance boost.
+    - Device.refreshView() has new view sources: control and content
+      UIAutomation tree walkers. They run faster than the default raw walker.
+    - Device.refreshView() window parameter can be a title (new) or
+      a handle.
+    - Device.refreshView() properties can be "all" (new) and "fast" (new)
+      in addition to explicit list of properties.
+    - Device.setRefreshViewDefaults() added for setting default values
+      for all optional refreshView() parameters.
+    - Fixed Device.refreshScreenshot() on different DPIs.
+    - Fixed Device.setClipboard (properly clear existing clipboard data).
+    - Workaround UIAutomation element hash collisions on refreshView().
+  * AAL/Python:
+    - Added fmbt.lastExecutedActionName() for checking which action
+      was previously executed. Not counting simulated actions.
+  * fmbt-scripter:
+    - Pressing Select/View no more runs refreshView() if the latest
+      view is newer than the latest screenshot. This saves time and helps
+      inspecting UI elements found by refreshView() when called with
+      special parameters.
+    - Minor UI improvements.
+  * Bug fixes and UI improvements on fmbt-scripter.
+
+ -- Antti Kervinen <antti.kervinen@intel.com>  Fri, 8 Jul 2016 11:42:00 +0300
+
 fmbt (0.33-1) unstable; urgency=low
 
   * AAL/Python:

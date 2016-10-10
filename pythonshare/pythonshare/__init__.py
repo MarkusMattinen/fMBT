@@ -65,7 +65,7 @@ def _send(msg, destination):
     if not destination in _send.locks:
         _send.locks[destination] = thread.allocate_lock()
     with _send.locks[destination]:
-        cPickle.dump(msg, destination)
+        cPickle.dump(msg, destination, 2)
         destination.flush()
 _send.locks = {}
 
@@ -75,10 +75,13 @@ def _recv(source):
     with _recv.locks[source]:
         try:
             return cPickle.load(source)
-        except ValueError, e:
-            return messages.Unloadable(e)
+        except (ValueError, cPickle.UnpicklingError), e:
+            return messages.Unloadable(str(e))
+        except EOFError:
+            raise
+        except Exception, e:
+            return messages.Unloadable("load error %s: %s" % (type(e).__name__, e))
 _recv.locks = {}
-
 
 def connect(hostspec, password=None, namespace=None):
     """Returns Connection to pythonshare server at hostspec.

@@ -53,6 +53,11 @@ import time
 import zlib
 
 try:
+    import pycosh
+except ImportError:
+    pycosh = None
+
+try:
     import fmbtpng
 except ImportError:
     fmbtpng = None
@@ -134,7 +139,9 @@ _g_keyNames = [
     "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
     "U", "V", "W", "X", "Y", "Z"]
 
-_g_viewSources = ["enumchildwindows", "uiautomation"]
+_g_viewSources = ["enumchildwindows", "uiautomation",
+                  "uiautomation/raw", "uiautomation/control",
+                  "uiautomation/content"]
 
 # ShowWindow showCmd
 SW_HIDE          = 0
@@ -170,7 +177,7 @@ class ViewItem(fmbtgti.GUIItem):
         """Returns list of view items from the root down to this item
 
         Note: works only for UIAutomation backend"""
-        if not self._view._viewSource == "uiautomation":
+        if not self._view._viewSource.startswith("uiautomation"):
             raise NotImplementedError(
                 "branch() works only for uiautomation at the moment")
         rv = []
@@ -185,7 +192,7 @@ class ViewItem(fmbtgti.GUIItem):
         return rv
 
     def children(self):
-        if self._view._viewSource == "enumchildwindows":
+        if self._view._viewSource.startswith("enumchildwindows"):
             return [self._view._viewItems[winfo[0]]
                     for winfo in self._view._itemTree[self._itemId]]
         else:
@@ -387,6 +394,12 @@ class View(object):
         area_items = [((i.bbox()[2] - i.bbox()[0]) * (i.bbox()[3] - i.bbox()[1]), i) for i in items]
         return [i for _, i in sorted(area_items)]
 
+    def items(self):
+        """
+        Returns list of all items in the view
+        """
+        return fmbtgti.sortItems(self._viewItems.values(), "topleft")
+
     def save(self, fileOrDirName):
         """
         Save view dump to a file.
@@ -429,8 +442,8 @@ class Device(fmbtgti.GUITestInterface):
         instance.
         """
         fmbtgti.GUITestInterface.__init__(self, **kwargs)
-        self._viewSource = _g_viewSources[1]
-        self._viewItemProperties = None
+        self._defaultViewSource = _g_viewSources[1]
+        self._refreshViewDefaults = kwargs
         self._lastView = None
         self._lastViewStats = {}
         self._refreshViewRetryLimit = 1
@@ -475,7 +488,7 @@ class Device(fmbtgti.GUITestInterface):
             '''componentArgs=("where", "name='%s'"))''' %
             escapedFilename)
 
-    def getFile(self, remoteFilename, localFilename=None):
+    def getFile(self, remoteFilename, localFilename=None, compress=False):
         """
         Fetch file from the device.
 
@@ -487,8 +500,13 @@ class Device(fmbtgti.GUITestInterface):
           localFilename (optional, string or None):
                   file to be saved to local filesystem. If None,
                   return contents of the file without saving them.
+
+          compress (optional, boolean or integer):
+                  if True, file contents will be compressed for the transfer.
+                  Integer (0-9) defines compression level. The default is
+                  False: transfer without compression.
         """
-        return self._conn.recvFile(remoteFilename, localFilename)
+        return self._conn.recvFile(remoteFilename, localFilename, compress)
 
     def getMatchingPaths(self, pathnamePattern):
         """
@@ -693,7 +711,7 @@ class Device(fmbtgti.GUITestInterface):
 
     def putFile(self, localFilename, remoteFilepath):
         """
-        Send local file to the device
+        Send local file to the device.
 
         Parameters:
 
@@ -707,6 +725,18 @@ class Device(fmbtgti.GUITestInterface):
                   will be saved with remoteFilepath as new name.
         """
         return self._conn.sendFile(localFilename, remoteFilepath)
+
+    def rmFile(self, remoteFilepath):
+        """
+        Remove a file from the device.
+
+        Parameters:
+
+          remoteFilepath (string):
+                  file to be removed from the device.
+        """
+        return self.existingConnection().evalPython(
+            "os.remove(%s)" % (repr(remoteFilepath),))
 
     def reconnect(self, connspec=None, password=None):
         """
@@ -739,7 +769,8 @@ class Device(fmbtgti.GUITestInterface):
             _adapterLog("reconnect failed: %s" % (e,))
             return False
 
-    def refreshView(self, window=None, forcedView=None, viewSource=None, items=[], properties=None):
+    def refreshView(self, window=None, forcedView=None, viewSource=None,
+                    items=None, properties=None, area=None):
         """
         (Re)reads widgets on the top window and updates the latest view.
 
@@ -758,6 +789,9 @@ class Device(fmbtgti.GUITestInterface):
                   "enumchildwindows" less data
                   but does not require UIAutomation.
                   The default is "uiautomation".
+                  You can define TreeWalker used by "uiautomation" by defining
+                  viewSource as "uiautomation/raw", "uiautomation/control" or
+                  "uiautomation/content".
                   See also setViewSource().
 
           items (list of view items, optional):
@@ -770,12 +804,30 @@ class Device(fmbtgti.GUITestInterface):
                   Works only for "uiautomation" view source.
                   See also setViewSource().
 
+          area ((left, top, right, bottom), optional):
+                  refresh only items that intersect the area.
+                  The default is None: locations do not affect refreshed
+                  items.
+
+        See also setRefreshViewDefaults().
+
         Returns View object.
         """
+        if window == None:
+            window = self._refreshViewDefaults.get("window", None)
+        if forcedView == None:
+            forcedView = self._refreshViewDefaults.get("forcedView", None)
         if viewSource == None:
-            viewSource = self._viewSource
+            viewSource = self.viewSource()
         if not viewSource in _g_viewSources:
             raise ValueError('invalid view source "%s"' % (viewSource,))
+        if items == None:
+            items = self._refreshViewDefaults.get("items", [])
+        if properties == None:
+            properties = self._refreshViewDefaults.get("properties", None)
+        if area == None:
+            area = self._refreshViewDefaults.get("area", None)
+
         if forcedView != None:
             retryCount = 0
             startTime = time.time()
@@ -803,13 +855,41 @@ class Device(fmbtgti.GUITestInterface):
                     topWindowBbox = self.topWindowProperties()['bbox']
                 except TypeError:
                     topWindowBbox = None # top window unavailable
+                if area:
+                    leftTopRightBottom = (
+                        self.intCoords((area[0], area[1])) +
+                        self.intCoords((area[2], area[3])))
+                else:
+                    leftTopRightBottom = None
                 if viewSource == "enumchildwindows":
                     viewData = self._conn.recvViewData(window)
                 else:
-                    if properties == None:
-                        properties = self._viewItemProperties
+                    if "/" in viewSource:
+                        walker = viewSource.split("/")[1]
+                    else:
+                        walker = "raw"
+                    if properties != None:
+                        if properties == "all":
+                            viewItemProperties = None
+                        elif properties == "fast":
+                            viewItemProperties = ["AutomationId",
+                                                   "BoundingRectangle",
+                                                   "ClassName",
+                                                   "HelpText",
+                                                   "ToggleState",
+                                                   "Value",
+                                                   "Minimum",
+                                                   "Maximum",
+                                                   "Name"]
+                        elif isinstance(properties, list) or isinstance(properties, tuple):
+                            viewItemProperties = list(properties)
+                        else:
+                            raise ValueError('invalid properties argument, expected "all", '
+                                             '"fast" or a list')
+                    else:
+                        viewItemProperties = properties
                     viewData = self._conn.recvViewUIAutomation(
-                        window, items, properties)
+                        window, items, viewItemProperties, leftTopRightBottom, walker)
                 file(viewFilename, "w").write(repr(viewData))
                 try:
                     self._lastView = View(
@@ -843,6 +923,13 @@ class Device(fmbtgti.GUITestInterface):
             "view": str(self._lastView),
             "item count": itemCount}
         return self._lastView
+
+    def refreshViewDefaults(self):
+        """Returns default arguments for refreshView() calls.
+
+        See also setRefreshViewDefaults().
+        """
+        return dict(self._refreshViewDefaults)
 
     def setClipboard(self, data):
         """
@@ -899,6 +986,25 @@ class Device(fmbtgti.GUITestInterface):
         Notes: calls SetForegroundWindow in user32.dll.
         """
         return self.existingConnection().sendSetForegroundWindow(window)
+
+    def setRefreshViewDefaults(self, **kwargs):
+        """Set new default arguments for refreshView() calls
+
+        Parameters:
+          **kwargs (keyword arguments)
+                  new default values for optional refreshView() parameters.
+
+        Note: default arguments are overridden by arguments given
+        directly in refreshView calls.
+
+        Note: setViewSource() can change the default arguments.
+
+        Example:
+          setRefreshViewDefaults(window="My app title",
+                                 viewSource="uiautomation/content")
+
+        """
+        self._refreshViewDefaults = kwargs
 
     def setRegistry(self, key, valueName, value, valueType=None):
         """
@@ -989,6 +1095,22 @@ class Device(fmbtgti.GUITestInterface):
         """
         return self.existingConnection().evalPython("products()")
 
+    def pycosh(self, command):
+        """
+        Run command in pycosh shell on the device.
+
+        Parameters:
+
+          command (string):
+                  pycosh command to be executed. Pycosh implements
+                  stripped-down versions of zip, tar, find, md5sum, diff,
+                  grep, head, tail, curl,... the usual handy shell utils.
+                  For information on pycosh commands, try
+                  device.pycosh("help") or run in shell:
+                  echo help | python -m pycosh.
+        """
+        return self.existingConnection().pycosh(command)
+
     def setScreenshotSize(self, size):
         """
         Force screenshots from device to use given resolution.
@@ -1025,7 +1147,9 @@ class Device(fmbtgti.GUITestInterface):
         Parameters:
 
           source (string):
-                  default source, "enumchildwindow" or "uiautomation".
+                  default source, "enumchildwindow" or "uiautomation",
+                  "uiautomation/raw", "uiautomation/control",
+                  "uiautomation/content".
 
           properties (string or list of strings, optional):
                   set list of view item properties to be read.
@@ -1036,30 +1160,15 @@ class Device(fmbtgti.GUITestInterface):
 
         Returns None.
 
-        See also refreshView(), viewSource().
+        See also refreshView(), viewSource(), refreshViewDefaults().
         """
         if not source in _g_viewSources:
             raise ValueError(
                 'invalid view source "%s", expected one of: "%s"' %
                 (source, '", "'.join(_g_viewSources)))
         if properties != None:
-            if properties == "all":
-                self._viewItemProperties = None
-            elif properties == "fast":
-                self._viewItemProperties = ["AutomationId",
-                                            "BoundingRectangle",
-                                            "ClassName",
-                                            "HelpText",
-                                            "ToggleState",
-                                            "Value",
-                                            "Minimum",
-                                            "Maximum",
-                                            "Name"]
-            elif isinstance(properties, list) or isinstance(properties, tuple):
-                self._viewItemProperties = list(properties)
-            else:
-                raise ValueError('invalid properties, expected "all", "fast" or a list')
-        self._viewSource = source
+            self._refreshViewDefaults["properties"] = properties
+        self._refreshViewDefaults["viewSource"] = source
 
     def shell(self, command):
         """
@@ -1081,7 +1190,7 @@ class Device(fmbtgti.GUITestInterface):
         """
         return self._conn.evalPython('shell(%s)' % (repr(command),))
 
-    def shellSOE(self, command, asyncStatus=None, asyncOut=None, asyncError=None):
+    def shellSOE(self, command, asyncStatus=None, asyncOut=None, asyncError=None, cwd=None):
         """
         Execute command on Windows.
 
@@ -1120,15 +1229,23 @@ class Device(fmbtgti.GUITestInterface):
                   asynchronously but standard error will not be
                   saved. The default is None.
 
+          cwd (string, optional)
+                  current working directory in which the command
+                  will be executed. If not given, the cwd defaults
+                  to the current working directory of the pythonshare
+                  server process on the device, or the cwd of the Python
+                  process if executed on host without pythonshare-server.
+
         Returns triplet: exit status, standard output and standard error
         from the command.
 
         If executing command fails, returns None, None, None.
         """
         return self._conn.evalPython(
-            'shellSOE(%s, asyncStatus=%s, asyncOut=%s, asyncError=%s)'
+            'shellSOE(%s, asyncStatus=%s, asyncOut=%s, asyncError=%s, cwd=%s)'
             % (repr(command),
-               repr(asyncStatus), repr(asyncOut), repr(asyncError)))
+               repr(asyncStatus), repr(asyncOut), repr(asyncError),
+               repr(cwd)))
 
     def showWindow(self, window, showCmd=SW_NORMAL):
         """
@@ -1207,11 +1324,12 @@ class Device(fmbtgti.GUITestInterface):
 
     def viewSource(self):
         """
-        Returns curent default view source.
+        Returns current default view source.
 
         See also refreshView(), setViewSource().
         """
-        return self._viewSource
+        return self._refreshViewDefaults.get(
+            "viewSource", self._defaultViewSource)
 
     def windowList(self):
         """
@@ -1276,6 +1394,7 @@ class WindowsConnection(fmbtgti.GUITestConnection):
     def __init__(self, connspec, password):
         fmbtgti.GUITestConnection.__init__(self)
         self._screenshotSize = (None, None) # autodetect
+        self._pycosh_sent_to_dut = False
         if connspec != None:
             self._agent = pythonshare.connect(connspec, password=password)
         else:
@@ -1289,6 +1408,13 @@ class WindowsConnection(fmbtgti.GUITestConnection):
         self._agent.exec_in(self._agent_ns, file(agentFilename).read())
         self.setScreenToDisplayCoords(lambda x, y: (x, y))
         self.setDisplayToScreenCoords(lambda x, y: (x, y))
+
+    def pycosh(self, command):
+        if not self._pycosh_sent_to_dut:
+            # upload pycosh module to DUT
+            self.execPython(file(inspect.getsourcefile(pycosh)).read())
+            self._pycosh_sent_to_dut = True
+        return self.evalPython("pycosh_eval(%s)" % (repr(command),))
 
     def setScreenshotSize(self, screenshotSize):
         self._screenshotSize = screenshotSize
@@ -1305,8 +1431,21 @@ class WindowsConnection(fmbtgti.GUITestConnection):
     def evalPython(self, code):
         return self._agent.eval_in(self._agent_ns, code)
 
-    def recvFile(self, remoteFilename, localFilename=None):
-        data = self._agent.eval_in(self._agent_ns, "file(%s, 'rb').read()" % (repr(remoteFilename),))
+    def recvFile(self, remoteFilename, localFilename=None, compress=False):
+        if compress:
+            if isinstance(compress, int):
+                compressLevel = compress
+            else:
+                compressLevel = 3
+            data = self._agent.eval_in(
+                self._agent_ns,
+                "zlib.compress(file(%s, 'rb').read(), %s)" % (
+                    repr(remoteFilename), compressLevel))
+            data = zlib.decompress(data)
+        else:
+            data = self._agent.eval_in(
+                self._agent_ns,
+                "file(%s, 'rb').read()" % (repr(remoteFilename),))
         if localFilename:
             file(localFilename, "wb").write(data)
             return True
@@ -1380,9 +1519,15 @@ class WindowsConnection(fmbtgti.GUITestConnection):
             raise ValueError('illegal window "%s", expected integer or string (hWnd or title)' % (window,))
         return rv
 
-    def recvViewUIAutomation(self, window=None, items=[], properties=None):
+    def recvViewUIAutomation(self, window=None, items=[], properties=None, area=None, walker="raw"):
         """returns list of dictionaries, each of which contains properties of
         an item"""
+        if not walker in ["raw", "control", "content"]:
+            raise ValueError('invalid walker %s' % (repr(walker),))
+        if window != None:
+            hwnd = self._window2hwnd(window)
+        else:
+            hwnd = None
         if properties == None:
             properties = []
         else:
@@ -1394,15 +1539,19 @@ class WindowsConnection(fmbtgti.GUITestConnection):
         dumps = []
         if items:
             for item in items:
-                dumps.append(self.evalPython("dumpUIAutomationElements(%s, %s, %s)" % (
-                    repr(window),
+                dumps.append(self.evalPython("dumpUIAutomationElements(%s, %s, %s, %s, %s)" % (
+                    repr(hwnd),
                     repr([str(item.id()) for item in item.branch()]),
-                    repr(properties))))
+                    repr(properties),
+                    repr(area),
+                    repr(walker))))
         else:
-            dumps.append(self.evalPython("dumpUIAutomationElements(%s, %s, %s)" % (
-                repr(window),
+            dumps.append(self.evalPython("dumpUIAutomationElements(%s, %s, %s, %s, %s)" % (
+                repr(hwnd),
                 repr([]),
-                repr(properties))))
+                repr(properties),
+                repr(area),
+                repr(walker))))
         rv = []
         prop_data = {}
         for dump in dumps:

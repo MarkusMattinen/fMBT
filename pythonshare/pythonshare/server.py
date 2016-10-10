@@ -41,7 +41,7 @@ client = pythonshare.client
 on_windows = (os.name == "nt")
 has_os_fdatasync = hasattr(os, "fdatasync")
 
-opt_debug_stdout_limit = 240
+opt_debug_limit = 240
 opt_log_fd = None
 opt_allow_new_namespaces = True
 
@@ -58,16 +58,16 @@ def timestamp():
     return rv
 
 def daemon_log(msg):
+    if opt_debug_limit >= 0:
+        if len(msg) > opt_debug_limit:
+            msg = msg[:opt_debug_limit] + "... [%s B]" % (len(msg),)
     formatted_msg = "%s %s\n" % (timestamp(), msg)
     if opt_log_fd != None:
         os.write(opt_log_fd, formatted_msg)
         if has_os_fdatasync:
             os.fdatasync(opt_log_fd)
-    if opt_debug and opt_debug_stdout_limit != 0:
-        if opt_debug_stdout_limit > 0 and len(formatted_msg) > opt_debug_stdout_limit:
-            sys.stdout.write(formatted_msg[:opt_debug_stdout_limit-3] + "...\n")
-        else:
-            sys.stdout.write(formatted_msg)
+    if opt_debug and opt_debug_limit != 0:
+        sys.stdout.write(formatted_msg)
         sys.stdout.flush()
 
 def code2string(code):
@@ -528,7 +528,8 @@ def _serve_connection(conn, conn_opts):
 
 def start_server(host, port,
                  ns_init_import_export=[],
-                 conn_opts={}):
+                 conn_opts={},
+                 listen_stdin=True):
     global _g_wake_server_function
     global _g_waker_lock
     daemon_log("pid: %s" % (os.getpid(),))
@@ -587,7 +588,7 @@ def start_server(host, port,
         event_queue = Queue.Queue()
         thread.start_new_thread(_store_return_value, (s.accept, event_queue))
         thread.start_new_thread(_store_return_value, (_g_waker_lock.acquire, event_queue))
-        if not sys.stdin.closed:
+        if not sys.stdin.closed and listen_stdin:
             daemon_log("listening to stdin")
             thread.start_new_thread(_store_return_value, (sys.stdin.readline, event_queue))
         else:
@@ -606,7 +607,7 @@ def start_server(host, port,
                 # returned from sys.stdin.readline
                 pass
     elif port == "stdin":
-        opt_debug_stdout_limit = 0
+        opt_debug_limit = 0
         conn = client.Connection(sys.stdin, sys.stdout)
         _serve_connection(conn, conn_opts)
     for ns in sorted(_g_remote_namespaces.keys()):
@@ -616,13 +617,14 @@ def start_server(host, port,
 
 def start_daemon(host="localhost", port=8089, debug=False,
                  log_fd=None, ns_init_import_export=[], conn_opts={},
-                 debug_stdout_limit=None):
-    global opt_log_fd, opt_debug, opt_debug_stdout_limit
+                 debug_limit=None):
+    global opt_log_fd, opt_debug, opt_debug_limit
     opt_log_fd = log_fd
     opt_debug = debug
-    if debug_stdout_limit != None:
-        opt_debug_stdout_limit = debug_stdout_limit
+    if debug_limit != None:
+        opt_debug_limit = debug_limit
     if opt_debug == False and not on_windows and isinstance(port, int):
+        listen_stdin = False
         # The usual fork magic, cleaning up all connections to the parent process
         if os.fork() > 0:
             return
@@ -657,5 +659,7 @@ def start_daemon(host="localhost", port=8089, debug=False,
                     os.close(fd)
                 except OSError:
                     pass
+    else:
+        listen_stdin = True
 
-    start_server(host, port, ns_init_import_export, conn_opts)
+    start_server(host, port, ns_init_import_export, conn_opts, listen_stdin)

@@ -18,7 +18,10 @@ import __builtin__
 import atexit
 import base64
 import ctypes
-import ctypes.wintypes
+try:
+    import ctypes.wintypes
+except:
+    raise ImportError("fmbtwindows_agent runs only on Windows")
 import glob
 import os
 import Queue
@@ -347,6 +350,11 @@ GMEM_FIXED = 0x0000
 GMEM_MOVEABLE = 0x0002
 GMEM_ZEROINIT = 0x0040
 
+try:
+    _dpiAware = ctypes.windll.user32.SetProcessDPIAware()
+except Exception, e:
+    _dpiAware = e
+
 # Structs for mouse and keyboard input
 
 class MOUSEINPUT(ctypes.Structure):
@@ -469,6 +477,9 @@ touchInfo2.rcContact = ctypes.wintypes.RECT(
     pointerInfo2.ptPixelLocation.y+5)
 touchInfo2.orientation = 90
 touchInfo2.pressure = 32000
+
+ctypes.windll.user32.VkKeyScanW.argtypes = [ctypes.c_wchar]
+ctypes.windll.user32.VkKeyScanW.restype = ctypes.c_short
 
 if not "touchInfoLock" in globals():
     touchInfoLock = thread.allocate_lock()
@@ -635,7 +646,6 @@ def Hardware(message, parameter=0):
 UPPER = frozenset('~!@#$%^&*()_+QWERTYUIOP{}|ASDFGHJKL:"ZXCVBNM<>?')
 LOWER = frozenset("`1234567890-=qwertyuiop[]\\asdfghjkl;'zxcvbnm,./")
 ORDER = string.ascii_letters + string.digits + ' \b\r\t'
-ALTER = dict(__builtin__.zip('!@#$%^&*()', '1234567890'))
 OTHER = {'`': VK_OEM_3,
          '~': VK_OEM_3,
          '-': VK_OEM_MINUS,
@@ -675,8 +685,24 @@ def keyboardStream(string):
         if shiftPressed and character in LOWER or not shiftPressed and character in UPPER:
             yield Keyboard(VK_SHIFT, shiftPressed and KEYEVENTF_KEYUP)
             shiftPressed = not shiftPressed
-        character = ALTER.get(character, character)
-        if character in ORDER:
+        if ctypes.windll.user32.VkKeyScanW(character) != -1:
+            code = ctypes.windll.user32.VkKeyScanW(character)
+            modifiers = (code & 0xff00) >> 8
+            if (modifiers & 1 and not shiftPressed) or (not modifiers & 1 and shiftPressed):
+                yield Keyboard(VK_SHIFT, shiftPressed and KEYEVENTF_KEYUP)
+                shiftPressed = not shiftPressed
+            if modifiers & 2:
+                yield Keyboard(VK_CONTROL)
+            if modifiers & 4:
+                yield Keyboard(VK_MENU)
+            yield Keyboard(code)
+            yield Keyboard(code, KEYEVENTF_KEYUP)
+            if modifiers & 4:
+                yield Keyboard(VK_MENU, KEYEVENTF_KEYUP)
+            if modifiers & 2:
+                yield Keyboard(VK_CONTROL, KEYEVENTF_KEYUP)
+            continue
+        elif character in ORDER:
             code = ord(character.upper())
         elif character in OTHER:
             code = OTHER[character]
@@ -789,7 +815,7 @@ def sendMouseUp(button=1):
     return sendInput(event)
 
 def sendMouseMove(x, y, button=1):
-    flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE
+    flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK
     x = x * 65535 /_mouse_input_area[0]
     y = y * 65535 /_mouse_input_area[1]
     event = Mouse(flags, x, y, 0)
@@ -878,38 +904,82 @@ using System.IO.Pipes;
 
 namespace FmbtWindows {
     public class UI {
-        public static void DumpElement(AutomationElement elt, int depth, Int32 parent, int[] fromPath, string[] properties, StreamWriter outStream) {
+        public static void DumpElement(AutomationElement elt, int depth, long parent, long[] fromPath, string[] properties, int[] bbox, TreeWalker walker, StreamWriter outStream) {
             string pValue;
-            Int32 eltHash = elt.GetHashCode();
+            string pName;
+            System.Windows.Automation.AutomationProperty[] supportedProps = elt.GetSupportedProperties();
+
+            // If location filtering is requested, skip element after reading only BoundingRectangle
+            if (bbox[0] > -1) {
+                foreach (AutomationProperty p in supportedProps) {
+                    pName = p.ProgrammaticName.Substring(p.ProgrammaticName.IndexOf(".")+1);
+                    if (pName == "BoundingRectangleProperty") {
+                        int eltLeft, eltTop, eltRight, eltBottom;
+                        pValue = "" + elt.GetCurrentPropertyValue(p);
+                        if (pValue.Contains(";")) {
+                            int[] bRect = Array.ConvertAll(pValue.Split(';'), int.Parse);
+                            eltLeft = bRect[0]; eltTop = bRect[1];
+                            eltRight = bRect[0] + bRect[2]; eltBottom = bRect[1] + bRect[3];
+                        } else if (pValue.Contains(",")) {
+                            int[] bRect = Array.ConvertAll(pValue.Split(','), int.Parse);
+                            eltLeft = bRect[0]; eltTop = bRect[1];
+                            eltRight = bRect[0] + bRect[2]; eltBottom = bRect[1] + bRect[3];
+                        } else {
+                            continue;
+                        }
+                        if (eltRight < bbox[0] || eltLeft > bbox[2] || eltBottom < bbox[1] || eltTop > bbox[3]) {
+                            return; // Skip this element and its descendants
+                        }
+                    }
+                }
+            }
+
+            // Print element properties
+            long eltHash = elt.GetHashCode();
+            eltHash = (parent << 32) + eltHash;
             if (fromPath.Length > depth) {
                 if (fromPath[depth] != eltHash)
                     return;
             }
             outStream.WriteLine("");
-            outStream.WriteLine("hash=" + eltHash);
+            outStream.WriteLine("hash=" + eltHash.ToString());
             outStream.WriteLine("parent=" + parent.ToString());
-            foreach (AutomationProperty p in elt.GetSupportedProperties()) {
-                string pName = p.ProgrammaticName.Substring(p.ProgrammaticName.IndexOf(".")+1);
-                if (pName.EndsWith("Property"))
+
+            foreach (AutomationProperty p in supportedProps) {
+                pName = p.ProgrammaticName.Substring(p.ProgrammaticName.IndexOf(".")+1);
+                if (pName.EndsWith("Property")) {
                     pName = pName.Substring(0, pName.LastIndexOf("Property"));
-                if (properties.Length == 1 || (properties.Length > 1 && properties.Contains(pName))) {
-                    pValue = "" + elt.GetCurrentPropertyValue(p);
-                    outStream.WriteLine(pName + "=" + pValue.Replace("\\", "\\\\").Replace("\r\n", "\\r\\n"));
+                    if (properties.Length == 1 || (properties.Length > 1 && properties.Contains(pName))) {
+                        pValue = "" + elt.GetCurrentPropertyValue(p);
+                        outStream.WriteLine(pName + "=" + pValue.Replace("\\", "\\\\").Replace("\r\n", "\\r\\n"));
+                    }
                 }
             }
 
-            AutomationElement eltChild = TreeWalker.RawViewWalker.GetFirstChild(elt);
+            // Print child elements
+            AutomationElement eltChild = walker.GetFirstChild(elt);
 
             while (eltChild != null) {
-                DumpElement(eltChild, depth+1, eltHash, fromPath, properties, outStream);
-                eltChild = TreeWalker.RawViewWalker.GetNextSibling(eltChild);
+                DumpElement(eltChild, depth+1, eltHash, fromPath, properties, bbox, walker, outStream);
+                eltChild = walker.GetNextSibling(eltChild);
             }
         }
 
-        public static void DumpWindow(UInt32 arg, string fromPathString, string properties, StreamWriter outStream) {
+        public static void DumpWindow(UInt32 arg, string fromPathString, string properties, string bboxString, string walkerString, StreamWriter outStream) {
             IntPtr hwnd = new IntPtr(arg);
-            int[] fromPath = Array.ConvertAll(fromPathString.Split(','), int.Parse);
-            DumpElement(AutomationElement.FromHandle(hwnd), 1, 0, fromPath, properties.Split(','), outStream);
+            long[] fromPath = Array.ConvertAll(fromPathString.Split(','), long.Parse);
+            int[] bbox = Array.ConvertAll(bboxString.Split(','), int.Parse);
+            TreeWalker walker;
+            if (walkerString == "raw") {
+                walker = TreeWalker.RawViewWalker;
+            } else if (walkerString == "control") {
+                walker = TreeWalker.ControlViewWalker;
+            } else if (walkerString == "content") {
+                walker = TreeWalker.ContentViewWalker;
+            } else {
+                return;
+            }
+            DumpElement(AutomationElement.FromHandle(hwnd), 1, 0, fromPath, properties.Split(','), bbox, walker, outStream);
         }
 
         public static void RunServer() {
@@ -922,9 +992,11 @@ namespace FmbtWindows {
                 UInt32 hwnd = UInt32.Parse(sr.ReadLine());
                 string fromPath = sr.ReadLine();
                 string properties = sr.ReadLine();
+                string bboxString = sr.ReadLine();
+                string walkerString = sr.ReadLine();
 
                 StreamWriter sw = new StreamWriter(pipeServer);
-                DumpWindow(hwnd, fromPath, properties, sw);
+                DumpWindow(hwnd, fromPath, properties, bboxString, walkerString, sw);
 
                 sw.WriteLine("end-of-dump-window");
                 sw.Flush();
@@ -951,7 +1023,7 @@ Add-Type -ReferencedAssemblies $assemblies -TypeDefinition $source -Language CSh
     except:
         raise
 
-def dumpUIAutomationElements(window=None, fromPath=[], properties=[]):
+def dumpUIAutomationElements(window=None, fromPath=[], properties=[], area=None, walker="raw"):
     if window == None:
         window = topWindow()
     f = None
@@ -968,10 +1040,16 @@ def dumpUIAutomationElements(window=None, fromPath=[], properties=[]):
             time.sleep(0.5)
             if time.time() > endTime:
                 raise Exception("dump timed out: cannot connect to uiautomation server")
-    f.write("%s\n%s\n%s\n" % (
+    if area == None:
+        areaBbox = (-1, -1, -1, -1)
+    else:
+        areaBbox = area
+    f.write("%s\n%s\n%s\n%s\n%s\n" % (
         window,
         ",".join(["-1"] + fromPath),
-        ",".join(["nonemptylist"] + properties)))
+        ",".join(["nonemptylist"] + properties),
+        ",".join([str(i) for i in areaBbox]),
+        walker))
     f.flush()
     rv = f.read()
     f.close()
@@ -1131,7 +1209,6 @@ def getClipboardText():
     return rv
 
 def setClipboardText(text):
-    ctypes.windll.user32.EmptyClipboard()
     if ctypes.windll.user32.OpenClipboard(0) == 0:
         raise Exception("error in opening clipboard")
     handle = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(text)+1)
@@ -1146,6 +1223,7 @@ def setClipboardText(text):
         ctypes.memmove(string_p, text, len(text))
     finally:
         ctypes.windll.kernel32.GlobalUnlock(handle)
+    ctypes.windll.user32.EmptyClipboard()
     ctypes.windll.user32.SetClipboardData(CF_TEXT, handle)
     ctypes.windll.user32.CloseClipboard()
 
@@ -1187,7 +1265,7 @@ def _exitStatusWriter(process, statusFile, filesToBeCleaned):
         try: os.remove(f)
         except: pass
 
-def shellSOE(command, asyncStatus=None, asyncOut=None, asyncError=None):
+def shellSOE(command, asyncStatus=None, asyncOut=None, asyncError=None, cwd=None):
     filesToBeCleaned = []
     if isinstance(command, list):
         useShell = False
@@ -1217,7 +1295,8 @@ def shellSOE(command, asyncStatus=None, asyncOut=None, asyncError=None):
         p = subprocess.Popen(command, shell=useShell,
                              stdin = file(os.devnull),
                              stdout = oFile,
-                             stderr = eFile)
+                             stderr = eFile,
+                             cwd = cwd)
         thread.start_new_thread(_exitStatusWriter, (p, sFile, filesToBeCleaned))
         return (None, None, None)
 
@@ -1226,7 +1305,8 @@ def shellSOE(command, asyncStatus=None, asyncOut=None, asyncError=None):
         p = subprocess.Popen(command, shell=useShell,
                              stdin = subprocess.PIPE,
                              stdout = subprocess.PIPE,
-                             stderr = subprocess.PIPE)
+                             stderr = subprocess.PIPE,
+                             cwd = cwd)
         out, err = p.communicate()
         status = p.returncode
     except OSError:
