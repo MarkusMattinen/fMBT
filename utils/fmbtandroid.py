@@ -3188,19 +3188,21 @@ class _AndroidDeviceConnection(fmbtgti.GUITestConnection):
                 exitstatus, stdout, stderr = None, None, None
         return exitstatus, stdout, stderr
 
-    def recvUiautomatorDump(self):
+    def recvUiautomatorDump(self, retry=5):
         remote_filename = "/sdcard/fmbtandroid-v.xml"
         self.pkill("monkey")
         self._startMonkey()
         status, out, err = self.shellSOE(
             "rm -f %s && uiautomator dump %s >/dev/null && cat %s" %
             (remote_filename, remote_filename, remote_filename))
-        self._resetMonkey()
         if status == 0:
+            self._resetMonkey()
             return out
         else:
             _adapterLog("error on uiautomator dump. status, out, err = %s" %
                         (repr((status, out, err)),))
+            if retry > 0:
+                return self.recvUiautomatorDump(retry - 1)
             return None
 
     def recvViewData(self, retry=3):
